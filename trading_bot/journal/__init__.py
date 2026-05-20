@@ -1,0 +1,2 @@
+"""Manual trade journal services."""
+

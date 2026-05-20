@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spy-qqq-iwm-alert-bot"
+version = "0.1.0"
+description = "Zero-cost local alert-only day-trading assistant for SPY, QQQ, and IWM."
+requires-python = ">=3.9"
+dependencies = [
+    "streamlit",
+    "pandas",
+    "numpy",
+    "plotly",
+    "yfinance",
+    "requests",
+    "pydantic",
+    "python-dotenv",
+    "sqlalchemy",
+    "apscheduler",
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+

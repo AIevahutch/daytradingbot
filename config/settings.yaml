@@ -1,0 +1,37 @@
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+database_path: data/trading_bot.sqlite
+timezone: America/New_York
+alert_threshold: 85
+scan_cadence_seconds: 60
+stale_data_minutes: 7
+max_alerts_per_symbol_per_day: 3
+telegram_max_attempts: 3
+telegram_retry_delay_seconds: 1.0
+manual_approval_required_for_rule_changes: true
+market_hours:
+  premarket_start: "04:00"
+  regular_start: "09:30"
+  regular_end: "16:00"
+  after_hours_end: "20:00"
+strategy:
+  min_risk_reward: 1.5
+  max_extension_from_vwap_pct: 1.2
+  low_volume_ratio: 0.65
+  chop_range_pct: 0.35
+  duplicate_alert_minutes: 90
+scoring_weights:
+  base_setup: 58
+  timeframe_continuity: 8
+  level_confluence: 7
+  vwap_confirmation: 7
+  volume_confirmation: 6
+  market_confirmation: 6
+  clean_risk_reward: 8
+  weak_volume_penalty: -12
+  chop_penalty: -18
+  conflicting_timeframes_penalty: -12
+  overextension_penalty: -10
+  stale_data_penalty: -30

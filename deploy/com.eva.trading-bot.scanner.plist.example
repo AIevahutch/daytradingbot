@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.eva.trading-bot.scanner</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/eva/Documents/Day Trading Bot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/eva/Documents/Day Trading Bot/.venv/bin/python</string>
+    <string>-m</string>
+    <string>trading_bot</string>
+    <string>scan</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/eva/Documents/Day Trading Bot/logs/launchd-scanner.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/eva/Documents/Day Trading Bot/logs/launchd-scanner.err.log</string>
+</dict>
+</plist>
