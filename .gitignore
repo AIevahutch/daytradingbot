@@ -10,3 +10,4 @@ data/*.csv
 data/*.sqlite-journal
 data/yfinance_cache/
 logs/
+.DS_Store
