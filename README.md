@@ -193,6 +193,12 @@ The MVP uses free best-effort yfinance data for personal/research use and local 
 
 The tests cover candle resampling, stale-data detection, level generation, VWAP, setup detection, 84/85 alert gating, hard blockers, alert formatting, Telegram retry persistence, replay storage, no-trade filters, P/L metrics, breakdowns, and recommendation generation.
 
+## Acceptance Check
+
+Use [docs/ACCEPTANCE_PROMPT.md](docs/ACCEPTANCE_PROMPT.md) as the validation prompt before calling the MVP done. It defines the required PASS / FAIL / BLOCKED gates for tests, health checks, scanner behavior, Telegram, dashboard, journal analytics, replay, deployment, and the alert-only safety rule.
+
+Use [docs/TESTING_VALIDATION_FRAMEWORK.md](docs/TESTING_VALIDATION_FRAMEWORK.md) before relying on live trading decisions. Passing technical validation means the software runs; it does not prove the strategy is profitable. The bot must progress through technical validation, historical replay, live paper trading, statistical validation, and only then small-size live testing.
+
 ## Local Deployment
 
 1. Install dependencies and fill in `.env`.
