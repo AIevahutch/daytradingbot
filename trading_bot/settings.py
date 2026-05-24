@@ -124,11 +124,18 @@ class Settings:
     )
     strategy: Dict[str, Any] = field(
         default_factory=lambda: {
-            "min_risk_reward": 1.5,
+            "min_risk_reward": 1.8,
+            "target1_r_multiple": 2.0,
+            "target2_r_multiple": 3.0,
             "max_extension_from_vwap_pct": 1.2,
             "low_volume_ratio": 0.65,
             "chop_range_pct": 0.35,
             "duplicate_alert_minutes": 90,
+            "symbol_alert_cooldown_minutes": 30,
+            "avoid_regular_open_minutes": 15,
+            "avoid_regular_close_minutes": 15,
+            "avoid_midday_start": "11:30",
+            "avoid_midday_end": "13:30",
         }
     )
     scoring_weights: Dict[str, int] = field(
@@ -145,6 +152,8 @@ class Settings:
             "conflicting_timeframes_penalty": -12,
             "overextension_penalty": -10,
             "stale_data_penalty": -30,
+            "momentum_continuation_penalty": -14,
+            "strat_continuation_penalty": -12,
         }
     )
 

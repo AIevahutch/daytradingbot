@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, time, timezone
 from typing import Dict, List
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.9+ includes zoneinfo.
+    ZoneInfo = None
 
 from trading_bot.levels.levels import level_map
 from trading_bot.models import Candle, Level
@@ -34,6 +40,10 @@ class NoTradeEngine:
                 "reason": "not enough intraday structure yet",
                 "hard_blocks": ["not enough intraday structure yet"],
             }
+
+        session_block = self._session_quality_block(candles[-1])
+        if session_block:
+            return session_block
 
         recent = candles[-12:]
         price = recent[-1].close
@@ -94,3 +104,60 @@ class NoTradeEngine:
         if extension and extension > 0.8:
             return "Price is already extended; wait for the planned entry zone instead of chasing."
         return "Avoid chasing outside the entry zone; let the level confirm first."
+
+    def _session_quality_block(self, candle: Candle) -> Dict:
+        regular_start = _parse_time(self.settings.market_hours.get("regular_start", "09:30"))
+        regular_end = _parse_time(self.settings.market_hours.get("regular_end", "16:00"))
+        clock = _exchange_clock(candle.timestamp, candle.source, self.settings.timezone)
+        if not (regular_start <= clock <= regular_end):
+            return {}
+
+        minutes_since_open = _minutes_between(regular_start, clock)
+        minutes_to_close = _minutes_between(clock, regular_end)
+        avoid_open = int(self.settings.strategy.get("avoid_regular_open_minutes", 0))
+        avoid_close = int(self.settings.strategy.get("avoid_regular_close_minutes", 0))
+        if avoid_open and minutes_since_open < avoid_open:
+            reason = "opening range noise; wait for structure to form"
+            return {
+                "is_no_trade": True,
+                "market_condition": "opening_range",
+                "reason": reason,
+                "hard_blocks": [reason],
+            }
+        if avoid_close and minutes_to_close <= avoid_close:
+            reason = "closing-window noise; avoid late emotional entries"
+            return {
+                "is_no_trade": True,
+                "market_condition": "closing_window",
+                "reason": reason,
+                "hard_blocks": [reason],
+            }
+        midday_start_raw = self.settings.strategy.get("avoid_midday_start")
+        midday_end_raw = self.settings.strategy.get("avoid_midday_end")
+        if midday_start_raw and midday_end_raw:
+            midday_start = _parse_time(str(midday_start_raw))
+            midday_end = _parse_time(str(midday_end_raw))
+            if midday_start <= clock <= midday_end:
+                reason = "midday participation lull; avoid lunch-session fakeouts"
+                return {
+                    "is_no_trade": True,
+                    "market_condition": "midday_lull",
+                    "reason": reason,
+                    "hard_blocks": [reason],
+                }
+        return {}
+
+
+def _parse_time(value: str) -> time:
+    hour, minute = value.split(":", 1)
+    return time(int(hour), int(minute))
+
+
+def _minutes_between(start: time, end: time) -> int:
+    return (end.hour * 60 + end.minute) - (start.hour * 60 + start.minute)
+
+
+def _exchange_clock(timestamp: datetime, source: str, timezone_name: str) -> time:
+    if source == "yfinance" and ZoneInfo is not None:
+        return timestamp.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(timezone_name)).time()
+    return timestamp.time()

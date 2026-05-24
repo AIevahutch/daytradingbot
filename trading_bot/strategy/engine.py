@@ -64,12 +64,14 @@ def _build_signal(
 ) -> SetupSignal:
     entry_mid = (entry_low + entry_high) / 2
     risk = abs(entry_mid - stop_loss)
+    target1_multiple = float(features.get("target1_r_multiple", 2.0))
+    target2_multiple = float(features.get("target2_r_multiple", 3.0))
     if direction == "LONG":
-        target1 = entry_mid + risk * 1.7
-        target2 = entry_mid + risk * 2.6
+        target1 = entry_mid + risk * target1_multiple
+        target2 = entry_mid + risk * target2_multiple
     else:
-        target1 = entry_mid - risk * 1.7
-        target2 = entry_mid - risk * 2.6
+        target1 = entry_mid - risk * target1_multiple
+        target2 = entry_mid - risk * target2_multiple
     rr = _risk_reward(direction, entry_mid, stop_loss, target1)
     return SetupSignal(
         symbol=symbol,
@@ -346,17 +348,46 @@ class StrategyEngine:
         bullish_alignment: bool,
         bearish_alignment: bool,
     ) -> List[SetupSignal]:
-        if len(candles) < 5:
+        if len(candles) < 16:
             return []
         last = candles[-1]
         recent = candles[-4:]
+        base = candles[-10:-4]
         closes = [c.close for c in recent]
         lows = [c.low for c in recent]
         highs = [c.high for c in recent]
         avg_range = sum(c.high - c.low for c in candles[-12:]) / min(len(candles[-12:]), 12)
+        if avg_range <= 0:
+            return []
+        if (
+            not common.get("volume_confirmed")
+            or not common.get("market_confirmed")
+            or common.get("weak_volume")
+            or common.get("conflicting_timeframes")
+            or common.get("stale_data")
+        ):
+            return []
+
+        base_high = max(c.high for c in base)
+        base_low = min(c.low for c in base)
+        base_range_pct = (base_high - base_low) / last.close * 100
+        last_range = max(last.high - last.low, 0.0001)
+        close_position = (last.close - last.low) / last_range
+        vwap_extension_pct = abs(last.close - vwap) / vwap * 100 if vwap else 0.0
+        if base_range_pct > 0.45 or vwap_extension_pct > 0.8:
+            return []
+
         signals: List[SetupSignal] = []
-        if closes == sorted(closes) and bullish_alignment and (vwap is None or last.close > vwap):
+        if (
+            all(current > previous for previous, current in zip(closes, closes[1:]))
+            and bullish_alignment
+            and (vwap is None or last.close > vwap)
+            and last.close > base_high
+            and close_position >= 0.6
+        ):
             pullback_low = min(lows)
+            if last.close - pullback_low > avg_range * 1.6:
+                return signals
             signals.append(
                 _build_signal(
                     symbol,
@@ -375,13 +406,21 @@ class StrategyEngine:
                         "level_confluence": False,
                         "vwap_confirmed": vwap is None or last.close > vwap,
                         "overextended": False,
+                        "base_range_pct": round(base_range_pct, 3),
+                        "vwap_extension_pct": round(vwap_extension_pct, 3),
                     },
                 )
             )
-        if closes == sorted(closes, reverse=True) and bearish_alignment and (
-            vwap is None or last.close < vwap
+        if (
+            all(current < previous for previous, current in zip(closes, closes[1:]))
+            and bearish_alignment
+            and (vwap is None or last.close < vwap)
+            and last.close < base_low
+            and close_position <= 0.4
         ):
             pullback_high = max(highs)
+            if pullback_high - last.close > avg_range * 1.6:
+                return signals
             signals.append(
                 _build_signal(
                     symbol,
@@ -400,6 +439,8 @@ class StrategyEngine:
                         "level_confluence": False,
                         "vwap_confirmed": vwap is None or last.close < vwap,
                         "overextended": False,
+                        "base_range_pct": round(base_range_pct, 3),
+                        "vwap_extension_pct": round(vwap_extension_pct, 3),
                     },
                 )
             )
@@ -464,4 +505,3 @@ class StrategyEngine:
                 )
             )
         return signals
-
