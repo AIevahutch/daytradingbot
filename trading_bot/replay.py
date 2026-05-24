@@ -10,6 +10,7 @@ from trading_bot.levels.levels import LevelEngine
 from trading_bot.models import Candle, SetupSignal
 from trading_bot.psychology.no_trade import NoTradeEngine
 from trading_bot.scoring.scoring import ConfidenceScorer
+from trading_bot.scoring.selection import ranked_setups
 from trading_bot.settings import Settings
 from trading_bot.storage import SQLiteStore
 from trading_bot.strategy.engine import StrategyEngine, trend_bias
@@ -44,7 +45,12 @@ class HistoricalReplay:
         current: Dict[str, List[Candle]] = {symbol: [] for symbol in symbols}
         indexes = {symbol: 0 for symbol in symbols}
         last_event_at: Dict[Tuple, datetime] = {}
+        alert_counts: Dict[Tuple[str, date], int] = {}
+        last_symbol_alert_at: Dict[Tuple[str, date], datetime] = {}
         duplicate_minutes = int(self.settings.strategy.get("duplicate_alert_minutes", 90))
+        symbol_cooldown_minutes = int(
+            self.settings.strategy.get("symbol_alert_cooldown_minutes", 30)
+        )
 
         try:
             for ts in timeline:
@@ -84,6 +90,7 @@ class HistoricalReplay:
                     setups = self.strategy.detect(
                         symbol, context, levels, market_biases, stale_data=stale
                     )
+                    scored_records = []
                     for setup in setups:
                         setup.created_at = ts
                         scored = self.scorer.score(setup, no_trade_state)
@@ -94,7 +101,57 @@ class HistoricalReplay:
                         outcome, r_multiple = _outcome_for_setup(
                             scored, _future_candles(one_minute[symbol], ts)
                         )
+                        scored_records.append((scored, key, outcome, r_multiple))
+
+                    ranked_alerts = [
+                        setup
+                        for setup in ranked_setups(record[0] for record in scored_records)
+                        if setup.status == "alert_ready"
+                    ]
+                    chosen_setup = ranked_alerts[0] if ranked_alerts else None
+
+                    for scored, key, outcome, r_multiple in scored_records:
+                        alert_key = (symbol, ts.date())
+                        prior_alert_count = alert_counts.get(alert_key, 0)
+                        last_symbol_alert = last_symbol_alert_at.get(alert_key)
+                        cooldown_active = (
+                            last_symbol_alert is not None
+                            and (ts - last_symbol_alert).total_seconds() / 60 < symbol_cooldown_minutes
+                        )
+                        lower_priority = (
+                            scored.status == "alert_ready"
+                            and chosen_setup is not None
+                            and scored is not chosen_setup
+                        )
                         event_type = _event_type(scored, outcome)
+                        if scored.status == "alert_ready":
+                            if (
+                                prior_alert_count >= self.settings.max_alerts_per_symbol_per_day
+                                or cooldown_active
+                                or lower_priority
+                            ):
+                                event_type = "avoided"
+                            else:
+                                event_type = "alerted"
+                        if event_type == "alerted":
+                            alert_counts[alert_key] = prior_alert_count + 1
+                            last_symbol_alert_at[alert_key] = ts
+                        cap_note = (
+                            "daily alert cap reached"
+                            if scored.status == "alert_ready"
+                            and prior_alert_count >= self.settings.max_alerts_per_symbol_per_day
+                            else ""
+                        )
+                        cooldown_note = (
+                            "symbol alert cooldown active"
+                            if scored.status == "alert_ready" and cooldown_active
+                            else ""
+                        )
+                        priority_note = (
+                            "lower-priority setup suppressed"
+                            if lower_priority
+                            else ""
+                        )
                         self.store.insert_paper_event(
                             run_id=run_id,
                             event_time=ts,
@@ -110,7 +167,10 @@ class HistoricalReplay:
                             target1=scored.target1,
                             outcome=outcome,
                             r_multiple=r_multiple,
-                            notes=scored.features.get("score_breakdown", {}).get(
+                            notes=cap_note
+                            or cooldown_note
+                            or priority_note
+                            or scored.features.get("score_breakdown", {}).get(
                                 "no_trade_reason", ""
                             ),
                             metadata={
@@ -230,7 +290,10 @@ def _setup_key(setup: SetupSignal, session_date: date) -> Tuple:
     )
 
 
-def _event_type(setup: SetupSignal, outcome: str) -> str:
+def _event_type(
+    setup: SetupSignal,
+    outcome: str,
+) -> str:
     if setup.status == "alert_ready":
         return "alerted"
     if setup.status == "blocked":

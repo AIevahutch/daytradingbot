@@ -11,6 +11,7 @@ from trading_bot.levels.levels import LevelEngine
 from trading_bot.models import Candle
 from trading_bot.psychology.no_trade import NoTradeEngine
 from trading_bot.scoring.scoring import ConfidenceScorer
+from trading_bot.scoring.selection import ranked_records
 from trading_bot.settings import Settings
 from trading_bot.storage import SQLiteStore
 from trading_bot.strategy.engine import StrategyEngine, trend_bias
@@ -99,47 +100,70 @@ class TradingScanner:
                 )
                 continue
 
+            scored_records = []
             for setup in setups:
                 scored = self.scorer.score(setup, no_trade_state)
                 setup_id = self.store.insert_setup(scored)
-                if not self.scorer.is_alertable(scored):
+                scored_records.append((scored, setup_id))
+
+            alertable_records = [
+                record for record in ranked_records(scored_records) if self.scorer.is_alertable(record[0])
+            ]
+            chosen_record = alertable_records[0] if alertable_records else None
+
+            for scored, setup_id in scored_records:
+                if chosen_record and setup_id == chosen_record[1]:
+                    continue
+                if self.scorer.is_alertable(scored):
+                    result["no_trade"].append(
+                        f"{symbol}: lower-priority {scored.setup_type} suppressed"
+                    )
+                else:
                     result["watch_only"].append(
                         f"{symbol}: {scored.setup_type} {scored.confidence}/100"
                     )
-                    continue
-                if self.store.alert_count_today(symbol) >= self.settings.max_alerts_per_symbol_per_day:
-                    result["no_trade"].append(f"{symbol}: daily alert cap reached")
-                    continue
-                if self.store.has_recent_duplicate_alert(
-                    scored, int(self.settings.strategy.get("duplicate_alert_minutes", 90))
-                ):
-                    result["no_trade"].append(f"{symbol}: duplicate alert suppressed")
-                    continue
-                message = format_alert(scored)
-                delivery = self.telegram.send_message(
-                    message,
-                    max_attempts=self.settings.telegram_max_attempts,
-                    retry_delay_seconds=self.settings.telegram_retry_delay_seconds,
-                )
-                alert_id = self.store.insert_alert(
-                    setup_id,
-                    scored,
-                    message,
-                    delivered=delivery.delivered,
-                    delivery_error=delivery.error,
-                )
-                self.store.insert_telegram_attempt(
-                    symbol=symbol,
-                    message=message,
-                    delivered=delivery.delivered,
-                    attempt_number=delivery.attempts,
-                    error=delivery.error,
-                    alert_id=alert_id,
-                    setup_id=setup_id,
-                )
-                result["alerts"].append(
-                    f"{symbol}: {scored.setup_type} {scored.confidence}/100"
-                )
+            if not chosen_record:
+                continue
+
+            scored, setup_id = chosen_record
+            if self.store.alert_count_today(symbol) >= self.settings.max_alerts_per_symbol_per_day:
+                result["no_trade"].append(f"{symbol}: daily alert cap reached")
+                continue
+            if self.store.has_recent_symbol_alert(
+                symbol, int(self.settings.strategy.get("symbol_alert_cooldown_minutes", 30))
+            ):
+                result["no_trade"].append(f"{symbol}: symbol alert cooldown active")
+                continue
+            if self.store.has_recent_duplicate_alert(
+                scored, int(self.settings.strategy.get("duplicate_alert_minutes", 90))
+            ):
+                result["no_trade"].append(f"{symbol}: duplicate alert suppressed")
+                continue
+            message = format_alert(scored)
+            delivery = self.telegram.send_message(
+                message,
+                max_attempts=self.settings.telegram_max_attempts,
+                retry_delay_seconds=self.settings.telegram_retry_delay_seconds,
+            )
+            alert_id = self.store.insert_alert(
+                setup_id,
+                scored,
+                message,
+                delivered=delivery.delivered,
+                delivery_error=delivery.error,
+            )
+            self.store.insert_telegram_attempt(
+                symbol=symbol,
+                message=message,
+                delivered=delivery.delivered,
+                attempt_number=delivery.attempts,
+                error=delivery.error,
+                alert_id=alert_id,
+                setup_id=setup_id,
+            )
+            result["alerts"].append(
+                f"{symbol}: {scored.setup_type} {scored.confidence}/100"
+            )
         status = "degraded" if result["errors"] else "ok"
         self.store.insert_scan_heartbeat(
             started_at, datetime.utcnow().replace(microsecond=0), status, result

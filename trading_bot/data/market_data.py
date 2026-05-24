@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List
 
 from trading_bot.models import Candle, utc_now
@@ -135,7 +135,7 @@ class MarketDataEngine:
         for index, row in frame.iterrows():
             timestamp = index.to_pydatetime()
             if getattr(timestamp, "tzinfo", None) is not None:
-                timestamp = timestamp.replace(tzinfo=None)
+                timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
             try:
                 open_price = float(row["Open"])
                 high = float(row["High"])

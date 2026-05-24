@@ -282,7 +282,13 @@ with tabs[5]:
 
 with tabs[6]:
     st.subheader("Paper Trading Replay")
-    paper_summary = store.paper_summary()
+    runs = df("paper_runs", 100)
+    latest_run_id = None
+    if not runs.empty:
+        latest_run_id = int(runs.sort_values("id", ascending=False).iloc[0]["id"])
+    paper_summary = store.paper_summary(latest_run_id)
+    if latest_run_id is not None:
+        st.caption(f"Showing latest replay run #{latest_run_id}. Historical runs remain below for comparison.")
     cols = st.columns(5)
     cols[0].metric("Replay Alerts", paper_summary["alerted_count"])
     cols[1].metric("Avoided", paper_summary["avoided_count"])
@@ -290,7 +296,6 @@ with tabs[6]:
     cols[3].metric("Win Rate", f"{paper_summary['win_rate']:.1f}%")
     cols[4].metric("Total R", f"{paper_summary['total_r']:.2f}")
 
-    runs = df("paper_runs", 100)
     events = df("paper_events", 500)
     if runs.empty:
         st.info("No replay runs yet. Run `python -m trading_bot replay --from YYYY-MM-DD --to YYYY-MM-DD`.")

@@ -47,7 +47,7 @@ def test_confidence_threshold_separates_84_and_85():
         target1=101,
         target2=102,
         invalidation=99.5,
-        risk_reward=1.7,
+        risk_reward=2.0,
         features={
             "timeframe_aligned": True,
             "level_confluence": True,
@@ -81,7 +81,7 @@ def test_hard_block_prevents_alert_even_when_raw_score_is_high():
         target1=101,
         target2=102,
         invalidation=99.5,
-        risk_reward=1.7,
+        risk_reward=2.0,
         features={
             "timeframe_aligned": True,
             "level_confluence": True,

@@ -495,6 +495,20 @@ class SQLiteStore:
             ).fetchone()
         return row is not None
 
+    def has_recent_symbol_alert(self, symbol: str, cooldown_minutes: int) -> bool:
+        cutoff = utc_now() - timedelta(minutes=cooldown_minutes)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select id from alerts
+                where symbol = ? and created_at >= ?
+                order by created_at desc
+                limit 1
+                """,
+                (symbol, _iso(cutoff)),
+            ).fetchone()
+        return row is not None
+
     def alert_count_today(self, symbol: str) -> int:
         today = utc_now().date().isoformat()
         with self.connect() as conn:

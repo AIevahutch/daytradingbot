@@ -136,6 +136,7 @@ Penalties:
 - overextension from VWAP
 - poor risk/reward
 - duplicate or excessive alerts
+- generic momentum or Strat continuation until paper/journal evidence improves
 
 Hard blockers:
 
@@ -146,6 +147,9 @@ Hard blockers:
 - poor risk/reward
 - conflicting timeframes
 - mixed SPY/QQQ/IWM confirmation
+- opening-range noise, midday participation lulls, and late closing-window entries
+
+Current A+ precision defaults in `config/settings.yaml` use a 2R target, 1.8R minimum risk/reward, same-symbol cooldown, daily alert caps, and session-quality blocks. These settings are designed to reduce alert volume and improve paper-trading precision, not to maximize activity.
 
 The bot should be comfortable producing no Telegram alert. A quiet day is acceptable when conditions are low quality.
 
@@ -196,6 +200,8 @@ The tests cover candle resampling, stale-data detection, level generation, VWAP,
 ## Acceptance Check
 
 Use [docs/ACCEPTANCE_PROMPT.md](docs/ACCEPTANCE_PROMPT.md) as the validation prompt before calling the MVP done. It defines the required PASS / FAIL / BLOCKED gates for tests, health checks, scanner behavior, Telegram, dashboard, journal analytics, replay, deployment, and the alert-only safety rule.
+
+Use [docs/A_PLUS_PRECISION_PROMPT.md](docs/A_PLUS_PRECISION_PROMPT.md) when tuning for higher win rate. It requires broad replay samples and explicitly blocks one-day overfitting.
 
 Use [docs/TESTING_VALIDATION_FRAMEWORK.md](docs/TESTING_VALIDATION_FRAMEWORK.md) before relying on live trading decisions. Passing technical validation means the software runs; it does not prove the strategy is profitable. The bot must progress through technical validation, historical replay, live paper trading, statistical validation, and only then small-size live testing.
 

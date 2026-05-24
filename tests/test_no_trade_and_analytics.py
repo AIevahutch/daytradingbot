@@ -14,11 +14,23 @@ def candle(index, close=100, volume=1000):
 
 def test_no_trade_flags_low_range_chop():
     candles = [candle(i, 100 + i * 0.001) for i in range(25)]
+    settings = Settings()
+    settings.strategy["avoid_midday_start"] = ""
+    settings.strategy["avoid_midday_end"] = ""
 
-    state = NoTradeEngine(Settings()).evaluate("SPY", candles, [], {"QQQ": "neutral"})
+    state = NoTradeEngine(settings).evaluate("SPY", candles, [], {"QQQ": "neutral"})
 
     assert state["is_no_trade"]
     assert "chop" in state["reason"]
+
+
+def test_no_trade_flags_midday_lull():
+    candles = [candle(i, 100 + i * 0.2, volume=5000) for i in range(25)]
+
+    state = NoTradeEngine(Settings()).evaluate("SPY", candles, [], {"QQQ": "bullish"})
+
+    assert state["is_no_trade"]
+    assert "midday" in state["reason"]
 
 
 def test_performance_metrics_and_breakdowns():

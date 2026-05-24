@@ -61,6 +61,16 @@ class ConfidenceScorer:
         if features.get("stale_data"):
             add_penalty("stale_data", int(weights.get("stale_data_penalty", -30)))
             hard_blocks.append("stale or missing market data")
+        if setup.setup_type == "Momentum continuation":
+            add_penalty(
+                "momentum_continuation_validation",
+                int(weights.get("momentum_continuation_penalty", -14)),
+            )
+        if setup.setup_type.startswith("Strat "):
+            add_penalty(
+                "strat_continuation_validation",
+                int(weights.get("strat_continuation_penalty", -12)),
+            )
 
         no_trade = no_trade or {}
         if no_trade.get("is_no_trade"):

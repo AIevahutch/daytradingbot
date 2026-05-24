@@ -118,8 +118,18 @@ def test_historical_replay_records_paper_events(tmp_path):
     start = datetime(2026, 1, 2, 9, 30)
     for symbol, base in [("SPY", 100.0), ("QQQ", 200.0), ("IWM", 150.0)]:
         store.upsert_candles(one_minute_series(symbol, start, count=150, base=base))
+        store.upsert_candles(
+            [
+                Candle(symbol, "1d", datetime(2026, 1, 1), base, base + 0.5, base - 1, base, 100000, "test"),
+                Candle(symbol, "1d", datetime(2026, 1, 2), base, base + 2, base - 0.5, base + 1, 100000, "test"),
+            ]
+        )
 
-    summary = HistoricalReplay(settings, store).run("2026-01-02", "2026-01-02")
+    replay = HistoricalReplay(settings, store)
+    replay.strategy = FakeStrategy()
+    replay.no_trade = FakeNoTrade()
+
+    summary = replay.run("2026-01-02", "2026-01-02")
 
     assert summary["run_id"] == 1
     assert summary["event_count"] > 0
