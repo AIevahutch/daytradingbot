@@ -1599,9 +1599,28 @@ class SQLiteStore:
         source_key: str,
         source_label: str,
         notes: str,
+        metadata: Optional[Dict] = None,
     ) -> Optional[int]:
         if self.has_source_paper_signal(source_key, mode, setup):
             return None
+        event_metadata = {
+            "mode": mode,
+            "paper_only": True,
+            "telegram_sent": False,
+            "signal_source": source_key,
+            FEATURE_ALERT_SOURCE: source_key,
+            FEATURE_SOURCE_LABEL: source_label,
+            "setup_id": setup_id,
+            "target2": setup.target2,
+            "invalidation": setup.invalidation,
+            "timeframe": setup.timeframe,
+            "market_condition": setup.market_condition,
+            "market_regime": (setup.features or {}).get(
+                "market_regime", setup.market_condition
+            ),
+            "features": setup.features,
+        }
+        event_metadata.update(metadata or {})
         return self.insert_paper_event(
             run_id=run_id,
             event_time=setup.created_at,
@@ -1618,23 +1637,7 @@ class SQLiteStore:
             target1=setup.target1,
             r_multiple=0.0,
             notes=notes,
-            metadata={
-                "mode": mode,
-                "paper_only": True,
-                "telegram_sent": False,
-                "signal_source": source_key,
-                FEATURE_ALERT_SOURCE: source_key,
-                FEATURE_SOURCE_LABEL: source_label,
-                "setup_id": setup_id,
-                "target2": setup.target2,
-                "invalidation": setup.invalidation,
-                "timeframe": setup.timeframe,
-                "market_condition": setup.market_condition,
-                "market_regime": (setup.features or {}).get(
-                    "market_regime", setup.market_condition
-                ),
-                "features": setup.features,
-            },
+            metadata=event_metadata,
         )
 
     def insert_source_paper_alert(

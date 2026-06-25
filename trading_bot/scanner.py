@@ -42,9 +42,12 @@ from trading_bot.signal_sources import (
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
     FAST_MOMENTUM_SIGNAL_SOURCE,
     FAST_MOMENTUM_SOURCE_LABEL,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
     LIVE_CARTER_PAPER_SOURCE,
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
     LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+    LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
     tag_alert_source,
 )
 from trading_bot.storage import SQLiteStore
@@ -207,6 +210,9 @@ class TradingScanner:
             for scored, setup_id in scored_records:
                 if _is_fast_momentum_experiment(scored) and self.scorer.is_alertable(scored):
                     self._record_fast_momentum_signal(result, scored, setup_id)
+                    dashboard_only_setup_ids.add(setup_id)
+                elif _is_high_potential_liquidity_sweep(scored, self.settings):
+                    self._record_high_potential_liquidity_sweep(result, scored, setup_id)
                     dashboard_only_setup_ids.add(setup_id)
 
             alertable_records = [
@@ -491,6 +497,58 @@ class TradingScanner:
             f"{setup.confidence}/100 paper-tracked dashboard-only"
         )
 
+    def _record_high_potential_liquidity_sweep(
+        self,
+        result: Dict[str, List[str]],
+        setup: SetupSignal,
+        setup_id: int,
+    ) -> None:
+        score_breakdown = (setup.features or {}).get("score_breakdown") or {}
+        raw_score = int(score_breakdown.get("raw_score") or setup.confidence or 0)
+        paper_setup = SetupSignal(
+            **{
+                **setup.__dict__,
+                "confidence": raw_score,
+                "status": "watch_only",
+                "features": {
+                    **(setup.features or {}),
+                    "blocked_core_confidence": setup.confidence,
+                    "candidate_raw_score": raw_score,
+                },
+            }
+        )
+        session_date = current_session_date(self.settings).isoformat()
+        run_id = self.store.get_or_create_paper_run(
+            LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+            session_date,
+            [setup.symbol],
+        )
+        event_id = self.store.insert_source_paper_signal(
+            run_id=run_id,
+            setup_id=setup_id,
+            setup=paper_setup,
+            mode=LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+            source_key=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+            source_label=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+            notes=(
+                "Dashboard-only paper trade from High-Potential Balanced Liquidity Sweep lane. "
+                "No Telegram alert sent; no real order placed."
+            ),
+            metadata={
+                "blocked_core_confidence": setup.confidence,
+                "candidate_raw_score": raw_score,
+            },
+        )
+        if event_id is None:
+            result["no_trade"].append(
+                f"High-Potential Liquidity {setup.symbol}: duplicate paper signal suppressed"
+            )
+            return
+        result["watch_only"].append(
+            f"High-Potential Liquidity {setup.symbol}: {setup.timeframe} {setup.direction} "
+            f"{raw_score}/100 paper-tracked dashboard-only"
+        )
+
     def _send_tactical_exit_alerts(self, contexts: Dict[str, Dict[str, List[Candle]]]) -> List[str]:
         sent = []
         since = datetime.utcnow().replace(microsecond=0) - timedelta(days=1)
@@ -617,6 +675,37 @@ def _is_fast_momentum_experiment(setup: SetupSignal) -> bool:
     return (
         setup.setup_type == "Fast momentum expansion"
         or bool((setup.features or {}).get("fast_momentum_expansion"))
+    )
+
+
+def _is_high_potential_liquidity_sweep(setup: SetupSignal, settings: Settings) -> bool:
+    if setup.setup_type != "Liquidity sweep reversal":
+        return False
+    if str(setup.timeframe) not in {"15m", "30m"}:
+        return False
+    if str(setup.market_condition or "").lower() not in {"balanced", "mixed", "chop"}:
+        return False
+    score_breakdown = (setup.features or {}).get("score_breakdown") or {}
+    raw_score = int(score_breakdown.get("raw_score") or setup.confidence or 0)
+    if raw_score < 90 or raw_score > 99:
+        return False
+    if setup.risk_reward < float(settings.strategy.get("min_risk_reward", 1.0)):
+        return False
+    expected_bias = "bullish" if str(setup.direction).upper() == "LONG" else "bearish"
+    peer_biases = (setup.features or {}).get("peer_biases") or {}
+    required_symbols = settings.strategy.get("strict_index_alignment_symbols") or [
+        "SPY",
+        "QQQ",
+    ]
+    if isinstance(required_symbols, str):
+        required_symbols = [
+            symbol.strip()
+            for symbol in required_symbols.split(",")
+            if symbol.strip()
+        ]
+    return all(
+        str(peer_biases.get(symbol, "")).lower() == expected_bias
+        for symbol in required_symbols
     )
 
 

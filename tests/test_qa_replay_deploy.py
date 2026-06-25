@@ -30,6 +30,8 @@ from trading_bot.signal_sources import (
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
     FAST_MOMENTUM_SIGNAL_SOURCE,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+    LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
     LIVE_FAST_MOMENTUM_PAPER_SOURCE,
     LIVE_CARTER_PAPER_SOURCE,
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
@@ -211,6 +213,48 @@ class FakeFastMomentumStrategy:
         ]
 
 
+class FakeHighPotentialLiquiditySweepStrategy:
+    def detect(
+        self,
+        symbol,
+        candles_by_tf,
+        levels,
+        market_biases,
+        stale_data=False,
+        alert_timeframes=None,
+    ):
+        return [
+            SetupSignal(
+                symbol=symbol,
+                setup_type="Liquidity sweep reversal",
+                direction="SHORT",
+                timeframe="15m",
+                created_at=utc_now(),
+                entry_low=298.90,
+                entry_high=299.10,
+                stop_loss=299.75,
+                target1=298.05,
+                target2=297.20,
+                invalidation=299.75,
+                risk_reward=1.0,
+                reasoning="Synthetic high-potential balanced liquidity sweep.",
+                avoid_if="IWM reclaims the sweep high.",
+                features={
+                    "level_confluence": True,
+                    "vwap_confirmed": True,
+                    "volume_confirmed": True,
+                    "timeframe_aligned": True,
+                    "market_confirmed": False,
+                    "peer_biases": {
+                        "SPY": "bearish",
+                        "QQQ": "bearish",
+                        "IWM": "neutral",
+                    },
+                },
+            )
+        ]
+
+
 class FakeCarterSqueeze:
     def detect(self, symbol, context, market_biases, no_trade_state=None):
         setup = SetupSignal(
@@ -300,6 +344,16 @@ class FakeNoTrade:
         return {
             "is_no_trade": False,
             "market_condition": "trending",
+            "reason": "",
+            "hard_blocks": [],
+        }
+
+
+class FakeBalancedNoTrade:
+    def evaluate(self, symbol, candles, levels, market_biases, stale_data=False):
+        return {
+            "is_no_trade": False,
+            "market_condition": "balanced",
             "reason": "",
             "hard_blocks": [],
         }
@@ -531,6 +585,47 @@ def test_scanner_paper_tracks_fast_momentum_without_telegram(tmp_path):
     assert metadata["paper_only"] is True
     assert metadata["telegram_sent"] is False
     assert metadata["signal_source"] == FAST_MOMENTUM_SIGNAL_SOURCE
+
+
+def test_scanner_paper_tracks_high_potential_liquidity_sweep_without_telegram(tmp_path):
+    settings = Settings(
+        symbols=["IWM"],
+        database_path=str(tmp_path / "high_potential_liquidity.sqlite"),
+        telegram_retry_delay_seconds=0,
+        max_alerts_per_symbol_per_day=3,
+    )
+    settings.research["enabled"] = False
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeHighPotentialLiquiditySweepStrategy()
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeBalancedNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert telegram.messages == []
+    assert outcome["alerts"] == []
+    assert any("High-Potential Liquidity IWM" in item for item in outcome["watch_only"])
+    alerts = store.list_rows("alerts", 10)
+    assert alerts == []
+    paper_runs = store.list_rows("paper_runs", 10)
+    assert len(paper_runs) == 1
+    assert paper_runs[0]["source"] == LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE
+    paper_events = store.list_rows("paper_events", 10)
+    assert len(paper_events) == 1
+    assert paper_events[0]["confidence"] == 98
+    metadata = json.loads(paper_events[0]["metadata_json"])
+    assert metadata["paper_only"] is True
+    assert metadata["telegram_sent"] is False
+    assert metadata["signal_source"] == HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE
+    assert metadata["blocked_core_confidence"] == 79
 
 
 def test_live_100_paper_outcomes_update_from_candles(tmp_path):
