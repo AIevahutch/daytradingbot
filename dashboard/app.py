@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,7 +53,7 @@ from trading_bot.signal_sources import (
 )
 import trading_bot.storage as storage_module
 from trading_bot.storage import SQLiteStore
-from trading_bot.tradingview import tradingview_url, tradingview_widget_url
+from trading_bot.tradingview import tradingview_url
 
 
 logger = logging.getLogger(__name__)
@@ -1562,13 +1561,7 @@ with market_tab:
     chart_cols = st.columns(len(settings.symbols))
     for index, symbol in enumerate(settings.symbols):
         with chart_cols[index]:
-            st.markdown(f"#### {symbol} Chart")
-            components.iframe(
-                tradingview_widget_url(symbol),
-                height=450,
-                scrolling=False,
-            )
-            link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
+            link_action(f"Open {symbol} Chart", tradingview_url(symbol))
 
     cols = st.columns(3)
     for idx, symbol in enumerate(settings.symbols):
