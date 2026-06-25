@@ -4,10 +4,14 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.save
 data/*.sqlite
 data/*.db
 data/*.csv
 data/*.sqlite-journal
+data/*.pid
+data/logs/
 data/yfinance_cache/
 logs/
+.streamlit/
 .DS_Store
