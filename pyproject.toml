@@ -25,6 +25,3 @@ dependencies = [
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
-
-[tool.setuptools.package-data]
-trading_bot = ["dashboard_auto_refresh/index.html"]

@@ -1,23 +1,22 @@
-from pathlib import Path
-
 from trading_bot.dashboard_refresh import (
-    MIN_REFRESH_INTERVAL_MS,
-    auto_refresh_asset_path,
-    refresh_interval_ms,
+    DEFAULT_REFRESH_INTERVAL_SECONDS,
+    is_fragment_rerun,
+    refresh_interval_seconds,
 )
 
 
+class FakeContext:
+    def __init__(self, fragment_ids_this_run):
+        self.fragment_ids_this_run = fragment_ids_this_run
+
+
 def test_refresh_interval_has_safe_minimum():
-    assert refresh_interval_ms(1) == MIN_REFRESH_INTERVAL_MS
-    assert refresh_interval_ms(60) == 60_000
+    assert refresh_interval_seconds(1) == 10
+    assert refresh_interval_seconds(60) == DEFAULT_REFRESH_INTERVAL_SECONDS
 
 
-def test_auto_refresh_component_uses_streamlit_value_protocol():
-    html = Path(auto_refresh_asset_path(), "index.html").read_text()
-
-    assert "streamlit:setComponentValue" in html
-    assert "streamlit:componentReady" in html
-    assert "userIsEditing" in html
-    assert "location.replace" not in html
-    assert "top.location" not in html
-    assert "parent.location" not in html
+def test_fragment_rerun_detection():
+    assert is_fragment_rerun(None) is False
+    assert is_fragment_rerun(FakeContext(None)) is False
+    assert is_fragment_rerun(FakeContext([])) is False
+    assert is_fragment_rerun(FakeContext(["fragment-id"])) is True

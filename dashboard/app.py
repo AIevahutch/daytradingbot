@@ -1521,10 +1521,11 @@ with health_tab:
 
     st.subheader("Runtime Health")
     health = run_healthcheck(settings, store)
-    hcols = st.columns(3)
+    hcols = st.columns(4)
     hcols[0].metric("System", health["status"].upper())
     hcols[1].metric("Checked", format_datetime(health["checked_at"]))
     hcols[2].metric("Database", Path(health["database"]).name)
+    hcols[3].metric("Dashboard Refreshed", format_datetime(datetime.now(timezone.utc)))
 
     for check in health["checks"]:
         render_check_card(check)
