@@ -50,6 +50,47 @@ class TradeJournal:
         )
         return self.store.insert_trade(trade)
 
+    def edit_trade(
+        self,
+        trade_id: int,
+        symbol: str,
+        setup_type: str,
+        direction: str,
+        opened_at: datetime,
+        closed_at: Optional[datetime],
+        took_trade: bool,
+        realized_pl: float,
+        entry_price: Optional[float] = None,
+        exit_price: Optional[float] = None,
+        quantity: Optional[float] = None,
+        confidence: Optional[int] = None,
+        market_condition: str = "unknown",
+        notes: str = "",
+        emotional_state: str = "",
+        mistake_tags: Optional[List[str]] = None,
+    ) -> None:
+        self.store.update_trade(
+            trade_id,
+            symbol=symbol,
+            setup_type=setup_type,
+            direction=direction,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            took_trade=took_trade,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            realized_pl=realized_pl,
+            confidence=confidence,
+            market_condition=market_condition,
+            notes=notes,
+            emotional_state=emotional_state,
+            mistake_tags=mistake_tags or [],
+        )
+
+    def remove_trade(self, trade_id: int) -> bool:
+        return self.store.delete_trade(trade_id)
+
     def add_partial_exit(
         self,
         trade_id: int,
@@ -77,4 +118,3 @@ class TradeJournal:
         tags: Optional[List[str]] = None,
     ) -> int:
         return self.store.insert_journal_note(note, trade_id, symbol, emotional_state, tags or [])
-
