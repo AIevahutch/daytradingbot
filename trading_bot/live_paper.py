@@ -9,8 +9,15 @@ from trading_bot.replay import _outcome_metrics_for_setup
 from trading_bot.signal_sources import (
     CARTER_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
+    FAILED_AUCTION_TRAP_SOURCE_LABEL,
+    FAST_MOMENTUM_SIGNAL_SOURCE,
+    FAST_MOMENTUM_SOURCE_LABEL,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
     LIVE_CARTER_PAPER_SOURCE,
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+    LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+    LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
 )
 from trading_bot.storage import SQLiteStore
 
@@ -18,6 +25,28 @@ from trading_bot.storage import SQLiteStore
 CURRENT_CORE_SETUP_TYPE = "Liquidity sweep reversal"
 CURRENT_CORE_TIMEFRAMES = {"15m", "30m"}
 CARTER_PUT_DIRECTION = "SHORT"
+EXPERIMENTAL_LANE_CONFIGS = (
+    {
+        "paper_source": LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+        "signal_source": FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
+        "source_label": FAILED_AUCTION_TRAP_SOURCE_LABEL,
+    },
+    {
+        "paper_source": LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        "signal_source": FAST_MOMENTUM_SIGNAL_SOURCE,
+        "source_label": FAST_MOMENTUM_SOURCE_LABEL,
+    },
+    {
+        "paper_source": LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        "signal_source": HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+        "source_label": HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+    },
+)
+GRADUATION_MIN_CLOSED_SIGNALS = 25
+GRADUATION_MIN_WIN_RATE = 80.0
+GRADUATION_MIN_PROFIT_FACTOR = 2.0
+GRADUATION_MIN_EXPECTANCY_R = 0.40
+GRADUATION_MIN_TRADING_DAYS = 3
 
 
 def refresh_live_100_outcomes(
@@ -173,6 +202,35 @@ def list_live_failed_auction_trap_paper_events(
     return []
 
 
+def list_live_experimental_lane_paper_events(
+    store: SQLiteStore,
+    paper_source: str,
+    limit: int = 500,
+) -> List[Dict]:
+    config = _experimental_lane_config(paper_source)
+    if config and hasattr(store, "list_live_source_paper_events"):
+        return store.list_live_source_paper_events(
+            str(config["signal_source"]),
+            str(config["paper_source"]),
+            limit,
+        )
+    return []
+
+
+def experimental_lane_summaries(
+    store: SQLiteStore,
+    lane_configs: Iterable[Dict] = EXPERIMENTAL_LANE_CONFIGS,
+) -> List[Dict]:
+    summaries = []
+    for config in lane_configs:
+        events = list_live_experimental_lane_paper_events(
+            store,
+            str(config["paper_source"]),
+        )
+        summaries.append(_experimental_lane_summary(config, events))
+    return summaries
+
+
 def update_paper_event_outcome(
     store: SQLiteStore,
     event_id: int,
@@ -213,6 +271,81 @@ def live_100_summary(events: List[Dict]) -> Dict[str, int]:
         "open": len(open_events),
         "not_triggered": len(not_triggered),
         "closed": len(wins) + len(losses),
+    }
+
+
+def _experimental_lane_config(paper_source: str) -> Optional[Dict]:
+    for config in EXPERIMENTAL_LANE_CONFIGS:
+        if config["paper_source"] == paper_source:
+            return config
+    return None
+
+
+def _experimental_lane_summary(config: Dict, events: List[Dict]) -> Dict:
+    open_events = [event for event in events if event.get("outcome") == "open"]
+    closed_events = [
+        event
+        for event in events
+        if event.get("outcome") in {"win", "loss", "breakeven"}
+    ]
+    wins = [
+        event
+        for event in closed_events
+        if float(event.get("r_multiple") or 0) > 0
+    ]
+    losses = [
+        event
+        for event in closed_events
+        if float(event.get("r_multiple") or 0) < 0
+    ]
+    not_triggered = [
+        event for event in events if event.get("outcome") == "not_triggered"
+    ]
+    total_r = round(
+        sum(float(event.get("r_multiple") or 0) for event in closed_events),
+        2,
+    )
+    gross_win = sum(float(event.get("r_multiple") or 0) for event in wins)
+    gross_loss = abs(sum(float(event.get("r_multiple") or 0) for event in losses))
+    win_rate = round(len(wins) / len(closed_events) * 100, 2) if closed_events else 0.0
+    profit_factor = (
+        round(gross_win / gross_loss, 2)
+        if gross_loss
+        else (float("inf") if gross_win else 0.0)
+    )
+    expectancy_r = round(total_r / len(closed_events), 2) if closed_events else 0.0
+    trading_days = {
+        str(event.get("event_time") or "")[:10]
+        for event in closed_events
+        if event.get("event_time")
+    }
+    gates = {
+        "closed_signals": len(closed_events) >= GRADUATION_MIN_CLOSED_SIGNALS,
+        "win_rate": win_rate >= GRADUATION_MIN_WIN_RATE,
+        "profit_factor": profit_factor >= GRADUATION_MIN_PROFIT_FACTOR,
+        "expectancy_r": expectancy_r >= GRADUATION_MIN_EXPECTANCY_R,
+        "trading_days": len(trading_days) >= GRADUATION_MIN_TRADING_DAYS,
+    }
+    eligible = bool(closed_events) and all(gates.values())
+    return {
+        "paper_source": config["paper_source"],
+        "signal_source": config["signal_source"],
+        "source_label": config["source_label"],
+        "total_signals": len(events),
+        "open_signals": len(open_events),
+        "closed_signals": len(closed_events),
+        "not_triggered": len(not_triggered),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "total_r": total_r,
+        "profit_factor": profit_factor,
+        "expectancy_r": expectancy_r,
+        "trading_days": len(trading_days),
+        "graduation_status": "Eligible for Eva review"
+        if eligible
+        else "Collecting evidence",
+        "graduation_gates": gates,
     }
 
 

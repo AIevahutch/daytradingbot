@@ -8,6 +8,8 @@ from trading_bot.data.market_data import (
     resample_candles,
 )
 from trading_bot.live_paper import (
+    experimental_lane_summaries,
+    list_live_experimental_lane_paper_events,
     list_live_failed_auction_trap_paper_events,
     list_live_carter_put_paper_events,
     list_current_live_100_paper_events,
@@ -30,7 +32,9 @@ from trading_bot.signal_sources import (
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
     FAST_MOMENTUM_SIGNAL_SOURCE,
+    FAST_MOMENTUM_SOURCE_LABEL,
     HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+    HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
     LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
     LIVE_FAST_MOMENTUM_PAPER_SOURCE,
     LIVE_CARTER_PAPER_SOURCE,
@@ -626,6 +630,117 @@ def test_scanner_paper_tracks_high_potential_liquidity_sweep_without_telegram(tm
     assert metadata["telegram_sent"] is False
     assert metadata["signal_source"] == HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE
     assert metadata["blocked_core_confidence"] == 79
+
+
+def test_experimental_lane_metrics_separate_open_and_closed_signals(tmp_path):
+    settings = Settings(database_path=str(tmp_path / "experimental_lanes.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    fast_run_id = store.get_or_create_paper_run(
+        LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        "2026-06-25",
+        ["SPY"],
+    )
+    sweep_run_id = store.get_or_create_paper_run(
+        LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        "2026-06-25",
+        ["IWM"],
+    )
+    base_time = datetime(2026, 6, 25, 7, 0)
+    fast_setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Fast Momentum Expansion",
+        direction="LONG",
+        timeframe="5m",
+        created_at=base_time,
+        entry_low=100.0,
+        entry_high=100.2,
+        stop_loss=99.5,
+        target1=101.2,
+        target2=102.2,
+        invalidation=99.5,
+        confidence=86,
+        risk_reward=2.0,
+        reasoning="Dashboard-only fast expansion test.",
+        avoid_if="SPY loses impulse base.",
+        status="watch_only",
+    )
+    sweep_setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="15m",
+        created_at=base_time + timedelta(minutes=15),
+        entry_low=200.0,
+        entry_high=200.2,
+        stop_loss=199.4,
+        target1=201.2,
+        target2=202.4,
+        invalidation=199.4,
+        confidence=98,
+        risk_reward=2.0,
+        reasoning="Balanced liquidity sweep candidate.",
+        avoid_if="QQQ loses direction agreement.",
+        status="watch_only",
+    )
+
+    fast_event_id = store.insert_source_paper_signal(
+        fast_run_id,
+        setup_id=1,
+        setup=fast_setup,
+        mode=LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        source_key=FAST_MOMENTUM_SIGNAL_SOURCE,
+        source_label=FAST_MOMENTUM_SOURCE_LABEL,
+        notes="Synthetic open fast momentum row.",
+    )
+    sweep_event_id = store.insert_source_paper_signal(
+        sweep_run_id,
+        setup_id=2,
+        setup=sweep_setup,
+        mode=LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        source_key=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+        source_label=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+        notes="Synthetic closed high-potential sweep row.",
+    )
+    store.update_paper_event_outcome(
+        int(sweep_event_id),
+        "win",
+        1.25,
+        {
+            "mode": LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+            "signal_source": HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+            "source_label": HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+            "timeframe": "15m",
+            "paper_only": True,
+            "telegram_sent": False,
+        },
+    )
+
+    fast_events = list_live_experimental_lane_paper_events(
+        store,
+        LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+    )
+    summaries = experimental_lane_summaries(store)
+
+    assert int(fast_event_id) == fast_events[0]["id"]
+    assert fast_events[0]["outcome"] == "open"
+    summary_by_source = {summary["paper_source"]: summary for summary in summaries}
+    assert summary_by_source[LIVE_FAST_MOMENTUM_PAPER_SOURCE]["open_signals"] == 1
+    assert summary_by_source[LIVE_FAST_MOMENTUM_PAPER_SOURCE]["closed_signals"] == 0
+    assert summary_by_source[LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE][
+        "open_signals"
+    ] == 0
+    assert summary_by_source[LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE][
+        "closed_signals"
+    ] == 1
+    assert summary_by_source[LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE][
+        "win_rate"
+    ] == 100.0
+    assert summary_by_source[LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE][
+        "expectancy_r"
+    ] == 1.25
+    assert summary_by_source[LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE][
+        "graduation_status"
+    ] == "Collecting evidence"
 
 
 def test_live_100_paper_outcomes_update_from_candles(tmp_path):
