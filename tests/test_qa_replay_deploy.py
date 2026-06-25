@@ -9,6 +9,7 @@ from trading_bot.data.market_data import (
 )
 from trading_bot.live_paper import (
     list_live_failed_auction_trap_paper_events,
+    list_live_carter_put_paper_events,
     list_current_live_100_paper_events,
     refresh_live_100_outcomes,
 )
@@ -446,7 +447,7 @@ def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     alert_time = datetime(2026, 6, 11, 10, 0)
     setup = SetupSignal(
         symbol="SPY",
-        setup_type="VWAP reclaim + retest",
+        setup_type="Liquidity sweep reversal",
         direction="LONG",
         timeframe="15m",
         created_at=alert_time,
@@ -486,7 +487,7 @@ def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     assert metadata["path_metrics"]["resolution"] == "target1"
 
 
-def test_current_live_100_paper_view_excludes_removed_setup_types(tmp_path):
+def test_current_live_100_paper_view_counts_only_core_strict_liquidity(tmp_path):
     settings = Settings(database_path=str(tmp_path / "current_strategy.sqlite"))
     store = SQLiteStore(settings.database_file)
     run_id = store.get_or_create_paper_run("live_100_alerts", "2026-06-11", ["SPY", "QQQ"])
@@ -528,8 +529,65 @@ def test_current_live_100_paper_view_excludes_removed_setup_types(tmp_path):
         avoid_if="QQQ reclaims sweep level.",
         status="alert_ready",
     )
+    liquidity_30m_setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="30m",
+        created_at=alert_time + timedelta(minutes=2),
+        entry_low=101.0,
+        entry_high=101.2,
+        stop_loss=100.5,
+        target1=102.5,
+        target2=103.5,
+        invalidation=100.5,
+        confidence=100,
+        risk_reward=2.0,
+        reasoning="Current 30m liquidity setup.",
+        avoid_if="SPY loses sweep level.",
+        status="alert_ready",
+    )
+    liquidity_1h_setup = SetupSignal(
+        symbol="QQQ",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="1h",
+        created_at=alert_time + timedelta(minutes=3),
+        entry_low=202.0,
+        entry_high=202.2,
+        stop_loss=201.0,
+        target1=204.0,
+        target2=205.0,
+        invalidation=201.0,
+        confidence=100,
+        risk_reward=2.0,
+        reasoning="1h liquidity is context-only for current core metrics.",
+        avoid_if="QQQ loses sweep level.",
+        status="alert_ready",
+    )
+    expansion_setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Fast momentum expansion",
+        direction="LONG",
+        timeframe="5m",
+        created_at=alert_time + timedelta(minutes=4),
+        entry_low=102.0,
+        entry_high=102.2,
+        stop_loss=101.5,
+        target1=103.2,
+        target2=104.2,
+        invalidation=101.5,
+        confidence=100,
+        risk_reward=2.0,
+        reasoning="Separate lane, not core strict.",
+        avoid_if="Momentum fails.",
+        status="alert_ready",
+    )
     store.insert_live_paper_alert(run_id, alert_id=1, setup_id=10, setup=vwap_setup)
     store.insert_live_paper_alert(run_id, alert_id=2, setup_id=11, setup=liquidity_setup)
+    store.insert_live_paper_alert(run_id, alert_id=3, setup_id=12, setup=liquidity_30m_setup)
+    store.insert_live_paper_alert(run_id, alert_id=4, setup_id=13, setup=liquidity_1h_setup)
+    store.insert_live_paper_alert(run_id, alert_id=5, setup_id=14, setup=expansion_setup)
 
     current_events = list_current_live_100_paper_events(
         store,
@@ -540,9 +598,84 @@ def test_current_live_100_paper_view_excludes_removed_setup_types(tmp_path):
         ],
     )
 
-    assert len(store.list_live_100_paper_events()) == 2
-    assert len(current_events) == 1
-    assert current_events[0]["setup_type"] == "Liquidity sweep reversal"
+    assert len(store.list_live_100_paper_events()) == 5
+    assert len(current_events) == 2
+    assert {event["setup_type"] for event in current_events} == {"Liquidity sweep reversal"}
+    assert {
+        json.loads(event["metadata_json"])["timeframe"] for event in current_events
+    } == {"15m", "30m"}
+
+
+def test_carter_put_paper_view_counts_only_short_side(tmp_path):
+    settings = Settings(database_path=str(tmp_path / "carter_put.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    run_id = store.get_or_create_paper_run(
+        LIVE_CARTER_PAPER_SOURCE,
+        "2026-06-11",
+        ["SPY", "QQQ"],
+    )
+    alert_time = datetime(2026, 6, 11, 10, 0)
+
+    short_setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Carter Squeeze",
+        direction="SHORT",
+        timeframe="15m",
+        created_at=alert_time,
+        entry_low=100.0,
+        entry_high=100.2,
+        stop_loss=101.0,
+        target1=98.5,
+        target2=97.5,
+        invalidation=101.0,
+        confidence=88,
+        risk_reward=2.0,
+        reasoning="Trusted put-side Carter setup.",
+        avoid_if="SPY reclaims squeeze trigger.",
+        status="alert_ready",
+    )
+    long_setup = SetupSignal(
+        symbol="QQQ",
+        setup_type="Carter Squeeze",
+        direction="LONG",
+        timeframe="15m",
+        created_at=alert_time + timedelta(minutes=1),
+        entry_low=200.0,
+        entry_high=200.2,
+        stop_loss=199.0,
+        target1=202.0,
+        target2=203.0,
+        invalidation=199.0,
+        confidence=88,
+        risk_reward=2.0,
+        reasoning="Call-side Carter remains separate evidence.",
+        avoid_if="QQQ loses squeeze trigger.",
+        status="alert_ready",
+    )
+    store.insert_source_paper_signal(
+        run_id,
+        setup_id=20,
+        setup=short_setup,
+        mode=LIVE_CARTER_PAPER_SOURCE,
+        source_key=CARTER_SIGNAL_SOURCE,
+        source_label=CARTER_SOURCE_LABEL,
+        notes="Synthetic Carter put-side paper row.",
+    )
+    store.insert_source_paper_signal(
+        run_id,
+        setup_id=21,
+        setup=long_setup,
+        mode=LIVE_CARTER_PAPER_SOURCE,
+        source_key=CARTER_SIGNAL_SOURCE,
+        source_label=CARTER_SOURCE_LABEL,
+        notes="Synthetic Carter call-side paper row.",
+    )
+
+    put_events = list_live_carter_put_paper_events(store)
+
+    assert len(put_events) == 1
+    assert put_events[0]["symbol"] == "SPY"
+    assert put_events[0]["direction"] == "SHORT"
 
 
 def test_scanner_sends_tactical_exit_alert_once(tmp_path):

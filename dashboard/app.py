@@ -2128,10 +2128,10 @@ with breakdowns_tab:
             )
 
 with paper_tab:
-    st.subheader("Paper Trading: Current Strategy")
+    st.subheader("Paper Trading: Current Rules")
     st.caption(
-        "This view shows one current-strategy paper W/L number. "
-        "Blocked setup types and older replay/backtest rows stay archived in SQLite but are not included here."
+        "This view shows current-rule paper W/L by lane. "
+        "Older replay/backtest rows and blocked setup families stay archived in SQLite but are not included in these headline scores."
     )
     excluded_setups = set(getattr(settings, "excluded_setup_types", []) or [])
     live_summary = live_paper.refresh_live_100_outcomes(store, excluded_setups)
@@ -2142,7 +2142,7 @@ with paper_tab:
         live_events.to_dict("records") if not live_events.empty else []
     )
 
-    st.markdown("### Current Strategy 100/100 Paper Trades")
+    st.markdown("### Core Strict Liquidity Sweep Paper Trades")
     tracking_since = "-"
     if not live_events.empty:
         tracking_since = format_datetime(live_events["event_time"].min(), include_relative=False)
@@ -2153,7 +2153,7 @@ with paper_tab:
         if closed_live
         else "No Closed Trades"
     )
-    live_cols[0].metric("100/100 Alerts", live_summary.get("alerted", 0))
+    live_cols[0].metric("Core Alerts", live_summary.get("alerted", 0))
     live_cols[1].metric("Wins", live_summary.get("wins", 0))
     live_cols[2].metric("Losses", live_summary.get("losses", 0))
     live_cols[3].metric("Still Open", live_summary.get("open", 0))
@@ -2161,13 +2161,14 @@ with paper_tab:
     live_cols[5].metric("Win Rate", live_win_rate)
     live_cols[6].metric("Tracking Since", tracking_since)
     st.caption(
-        "This section only tracks current-rule 100/100 live alerts. "
+        "This section only counts 100/100 Liquidity Sweep Reversal rows on 15m/30m. "
+        "Fast Momentum, premarket/previous-day breaks, VWAP, 1h liquidity, and experimental lanes are excluded from core. "
         "A win means the +1R paper target hit after entry triggered. "
         "A loss means stop hit first. Open means entry triggered but target/stop has not resolved yet. "
-        "Blocked setup types are excluded from this current-strategy score."
+        "Raw historical rows remain archived for research."
     )
     if live_events.empty:
-        st.info("No live 100/100 paper trades have been recorded yet.")
+        st.info("No current-rule core paper trades have been recorded yet.")
     else:
         readable_live = live_events.copy()
         readable_live["alert_time"] = readable_live["event_time"].apply(format_datetime)
@@ -2191,7 +2192,7 @@ with paper_tab:
             "stop",
             "target",
         ]
-        st.markdown("#### 100/100 Trade List")
+        st.markdown("#### Core Strict Trade List")
         for _, event in readable_live.head(12).iterrows():
             with st.container(border=True):
                 top_cols = st.columns([1.1, 1.1, 1.1, 2.1, 1, 1])
@@ -2208,9 +2209,12 @@ with paper_tab:
                 detail_cols[3].caption(f"Paper target (+1R): {safe_text(event.get('target'))}")
                 with detail_cols[4]:
                     link_action("Open Chart", tradingview_url(safe_text(event.get("symbol"))))
-    st.markdown("### Carter Squeeze Paper Trades")
-    carter_summary = live_paper.refresh_live_carter_outcomes(store)
-    carter_events = pd.DataFrame(live_paper.list_live_carter_paper_events(store))
+    st.markdown("### Carter Squeeze Put Paper Trades")
+    st.caption(
+        "Counts only Carter SHORT/put-side paper alerts. Carter call-side remains blocked or watch-only until it earns separate evidence."
+    )
+    carter_summary = live_paper.refresh_live_carter_put_outcomes(store)
+    carter_events = pd.DataFrame(live_paper.list_live_carter_put_paper_events(store))
     carter_summary = live_paper.live_100_summary(
         carter_events.to_dict("records") if not carter_events.empty else []
     )
@@ -2224,7 +2228,7 @@ with paper_tab:
         if carter_closed
         else "No Closed Trades"
     )
-    carter_cols[0].metric("Carter Alerts", carter_summary.get("alerted", 0))
+    carter_cols[0].metric("Carter Put Alerts", carter_summary.get("alerted", 0))
     carter_cols[1].metric("Wins", carter_summary.get("wins", 0))
     carter_cols[2].metric("Losses", carter_summary.get("losses", 0))
     carter_cols[3].metric("Still Open", carter_summary.get("open", 0))
@@ -2232,7 +2236,7 @@ with paper_tab:
     carter_cols[5].metric("Win Rate", carter_win_rate)
     carter_cols[6].metric("Tracking Since", carter_tracking_since)
     if carter_events.empty:
-        st.info("No Carter Squeeze paper trades have been recorded yet.")
+        st.info("No Carter Squeeze put-side paper trades have been recorded yet.")
     else:
         readable_carter = carter_events.copy()
         readable_carter["alert_time"] = readable_carter["event_time"].apply(format_datetime)

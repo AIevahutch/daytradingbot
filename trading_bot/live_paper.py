@@ -15,23 +15,30 @@ from trading_bot.signal_sources import (
 from trading_bot.storage import SQLiteStore
 
 
+CURRENT_CORE_SETUP_TYPE = "Liquidity sweep reversal"
+CURRENT_CORE_TIMEFRAMES = {"15m", "30m"}
+CARTER_PUT_DIRECTION = "SHORT"
+
+
 def refresh_live_100_outcomes(
     store: SQLiteStore,
     excluded_setup_types: Optional[Iterable[str]] = None,
 ) -> Dict[str, int]:
-    if excluded_setup_types:
-        return refresh_live_source_outcomes(
-            store,
-            lambda store_obj: list_current_live_100_paper_events(
-                store_obj,
-                excluded_setup_types,
-            ),
-        )
-    return refresh_live_source_outcomes(store, list_live_100_paper_events)
+    return refresh_live_source_outcomes(
+        store,
+        lambda store_obj: list_current_live_100_paper_events(
+            store_obj,
+            excluded_setup_types,
+        ),
+    )
 
 
 def refresh_live_carter_outcomes(store: SQLiteStore) -> Dict[str, int]:
     return refresh_live_source_outcomes(store, list_live_carter_paper_events)
+
+
+def refresh_live_carter_put_outcomes(store: SQLiteStore) -> Dict[str, int]:
+    return refresh_live_source_outcomes(store, list_live_carter_put_paper_events)
 
 
 def refresh_live_failed_auction_trap_outcomes(store: SQLiteStore) -> Dict[str, int]:
@@ -109,17 +116,38 @@ def list_live_100_paper_events(store: SQLiteStore, limit: int = 500) -> List[Dic
 
 def list_current_live_100_paper_events(
     store: SQLiteStore,
-    excluded_setup_types: Iterable[str],
+    excluded_setup_types: Optional[Iterable[str]] = None,
     limit: int = 500,
 ) -> List[Dict]:
     excluded = {str(setup_type) for setup_type in excluded_setup_types or []}
     events = list_live_100_paper_events(store, limit)
-    if not excluded:
-        return events
     return [
         event
         for event in events
-        if str(event.get("setup_type") or "") not in excluded
+        if is_current_core_paper_event(event)
+        and str(event.get("setup_type") or "") not in excluded
+    ]
+
+
+def is_current_core_paper_event(event: Dict) -> bool:
+    metadata = _metadata(event)
+    return (
+        str(event.get("setup_type") or "") == CURRENT_CORE_SETUP_TYPE
+        and str(metadata.get("timeframe") or "") in CURRENT_CORE_TIMEFRAMES
+    )
+
+
+def is_carter_put_paper_event(event: Dict) -> bool:
+    return str(event.get("direction") or "").upper() == CARTER_PUT_DIRECTION
+
+
+def list_live_carter_put_paper_events(
+    store: SQLiteStore, limit: int = 500
+) -> List[Dict]:
+    return [
+        event
+        for event in list_live_carter_paper_events(store, limit)
+        if is_carter_put_paper_event(event)
     ]
 
 
