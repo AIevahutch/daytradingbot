@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
+import importlib
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
+import re
 import sys
+from typing import Optional, Union
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,27 +24,347 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading_bot.analytics.performance import breakdowns, calculate_metrics, period_pl
 from trading_bot.analytics.recommendations import RecommendationEngine
+from trading_bot.alerts.telegram import TelegramClient
+from trading_bot.email.gmail import GmailSMTPClient
 from trading_bot.health import run_healthcheck
+from trading_bot.journal.delete import remove_trade_entry
+from trading_bot.journal.rules import (
+    add_trading_rule_entry,
+    delete_trading_rule_entry,
+    list_trading_rule_entries,
+    update_trading_rule_entry,
+)
 from trading_bot.journal.trade_journal import TradeJournal
+import trading_bot.live_paper as live_paper
+from trading_bot.research.agent import ResearchAgent, current_session_date
+from trading_bot.research.calendar import PHASES, PHASE_LABELS, phase_for_datetime
+from trading_bot.runtime.scanner_process import (
+    reconcile_scanner_status,
+    recover_scanner_if_stale,
+    run_scan_once,
+    start_scanner,
+    stop_scanner,
+)
 from trading_bot.settings import load_settings
+from trading_bot.signal_sources import (
+    CORE_SOURCE_LABEL,
+    LIVE_CARTER_PAPER_SOURCE,
+    LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+    LIVE_CORE_100_PAPER_SOURCE,
+)
+import trading_bot.storage as storage_module
 from trading_bot.storage import SQLiteStore
 
+
+logger = logging.getLogger(__name__)
+live_paper = importlib.reload(live_paper)
+storage_module = importlib.reload(storage_module)
 
 st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 
+AUTO_REFRESH_SECONDS = 60
+
+
+def enable_auto_refresh(interval_seconds: int = AUTO_REFRESH_SECONDS) -> None:
+    interval_ms = max(int(interval_seconds * 1000), 10000)
+    components.html(
+        f"""
+        <script>
+        const refreshIntervalMs = {interval_ms};
+        function userIsEditing() {{
+          try {{
+            const active = window.parent.document.activeElement;
+            if (!active) return false;
+            const tag = (active.tagName || "").toLowerCase();
+            return tag === "input" || tag === "textarea" || active.isContentEditable;
+          }} catch (error) {{
+            return false;
+          }}
+        }}
+        function scheduleDashboardRefresh() {{
+          window.setTimeout(() => {{
+            if (userIsEditing()) {{
+              scheduleDashboardRefresh();
+              return;
+            }}
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set("auto_refresh", Date.now().toString());
+            window.parent.location.replace(url.toString());
+          }}, refreshIntervalMs);
+        }}
+        scheduleDashboardRefresh();
+        </script>
+        """,
+        height=1,
+    )
+
+
+enable_auto_refresh()
+
+
 @st.cache_resource
-def get_store():
+def get_store(config_mtime: float):
     settings = load_settings()
     return settings, SQLiteStore(settings.database_file)
 
 
-settings, store = get_store()
+CONFIG_FILE = PROJECT_ROOT / "config" / "settings.yaml"
+settings, store = get_store(CONFIG_FILE.stat().st_mtime if CONFIG_FILE.exists() else 0.0)
 journal = TradeJournal(store)
+DISPLAY_TZ = ZoneInfo(getattr(settings, "display_timezone", "America/Los_Angeles"))
+OPTIONAL_DASHBOARD_TABLES = {
+    "research_briefs",
+    "research_evidence",
+    "research_email_attempts",
+}
+TELEGRAM_TEST_MESSAGE = (
+    "SPY/QQQ/IWM alert bot test message. Telegram delivery is working. "
+    "This is an operational test only, not a trade alert."
+)
+MOMENTUM_EXCEPTION_TITLE = "Momentum Exception:"
+MOMENTUM_EXCEPTION_NOTE = "\n".join(
+    [
+        MOMENTUM_EXCEPTION_TITLE,
+        "- High research risk does not block alerts anymore; it adds a caution warning to stay selective.",
+        "- Fast Momentum Expansion and all-index trend continuation still need SPY/QQQ/IWM alignment.",
+        "- Every alert still requires volume confirmation, timeframe alignment, VWAP confirmation, and clean risk/reward.",
+        "- This is a heads-up only. Confirm on TradingView before acting.",
+    ]
+)
+
+
+DATE_COLUMNS = {
+    "created_at",
+    "attempted_at",
+    "opened_at",
+    "closed_at",
+    "started_at",
+    "completed_at",
+    "reviewed_at",
+    "approved_at",
+    "event_time",
+    "timestamp",
+}
+DATE_ONLY_COLUMNS = {"session_date", "start_date", "end_date"}
+ISO_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+MINUTES_PATTERN = re.compile(r"(\d+(?:\.\d+)?) minutes old")
+MISTAKE_TAG_OPTIONS = [
+    "FOMO",
+    "revenge trade",
+    "oversized position",
+    "poor entry",
+    "ignored stop",
+    "emotional trade",
+]
+
+
+def inject_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+          --app-bg: #f6f7f5;
+          --panel: #ffffff;
+          --ink: #151515;
+          --muted: #6f746f;
+          --line: #e3e5df;
+          --blue: #0a84ff;
+          --green: #2e7d32;
+          --amber: #b7791f;
+          --red: #c62828;
+        }
+        .stApp {
+          background: var(--app-bg);
+          color: var(--ink);
+        }
+        .block-container {
+          padding-top: 2rem;
+          padding-bottom: 3rem;
+          max-width: 1240px;
+        }
+        h1, h2, h3 {
+          letter-spacing: 0;
+        }
+        div[data-testid="stMetric"] {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          padding: 14px 16px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        div[data-testid="stMetricLabel"] p {
+          color: var(--muted);
+          font-size: 0.83rem;
+        }
+        div[data-testid="stMetricValue"] {
+          font-size: 1.7rem;
+        }
+        .stButton button,
+        .stLinkButton a {
+          border-radius: 8px !important;
+          min-height: 42px;
+          font-weight: 650;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+          gap: 6px;
+          border-bottom: 1px solid var(--line);
+        }
+        .stTabs [data-baseweb="tab"] {
+          border-radius: 8px 8px 0 0;
+          padding: 10px 14px;
+        }
+        div[data-testid="stExpander"] {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        div[data-testid="stDataFrame"] {
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          overflow: hidden;
+        }
+        .app-hero {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          padding: 18px 20px;
+          margin-bottom: 18px;
+          box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+        }
+        .eyebrow {
+          color: var(--muted);
+          font-size: 0.82rem;
+          font-weight: 650;
+          text-transform: uppercase;
+          letter-spacing: .08em;
+          margin-bottom: 4px;
+        }
+        .hero-title {
+          font-size: 2.2rem;
+          line-height: 1.05;
+          font-weight: 760;
+          color: var(--ink);
+          margin: 0;
+        }
+        .hero-copy {
+          color: var(--muted);
+          margin: 8px 0 0 0;
+          font-size: 0.98rem;
+        }
+        .status-row {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+          align-items: center;
+          margin-top: 12px;
+        }
+        .pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          border-radius: 999px;
+          border: 1px solid var(--line);
+          background: #fafafa;
+          color: var(--ink);
+          padding: 5px 10px;
+          font-size: 0.82rem;
+          font-weight: 650;
+          white-space: nowrap;
+        }
+        .pill.ok {
+          background: #edf7ee;
+          border-color: #c9e8cd;
+          color: var(--green);
+        }
+        .pill.warn {
+          background: #fff7e6;
+          border-color: #f1d49a;
+          color: var(--amber);
+        }
+        .pill.fail {
+          background: #fff0f0;
+          border-color: #f0b8b8;
+          color: var(--red);
+        }
+        .pill.info {
+          background: #edf5ff;
+          border-color: #bfdcff;
+          color: #0757a8;
+        }
+        .mini-card {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          padding: 14px;
+          margin-bottom: 12px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        .card-title {
+          font-size: 1.05rem;
+          font-weight: 720;
+          margin: 0 0 4px 0;
+          color: var(--ink);
+        }
+        .card-meta {
+          color: var(--muted);
+          font-size: 0.86rem;
+          margin: 0;
+        }
+        .reason-text {
+          color: #303331;
+          line-height: 1.45;
+        }
+        .subtle {
+          color: var(--muted);
+        }
+        .research-grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(118px, 1fr));
+          gap: 12px;
+          margin-bottom: 14px;
+        }
+        .research-metric {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          padding: 14px 16px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+          min-height: 88px;
+        }
+        .research-metric-label {
+          color: var(--muted);
+          font-size: 0.82rem;
+          margin: 0 0 8px 0;
+        }
+        .research-metric-value {
+          color: var(--ink);
+          font-size: 1.55rem;
+          line-height: 1.12;
+          font-weight: 650;
+          margin: 0;
+          overflow-wrap: anywhere;
+        }
+        @media (max-width: 760px) {
+          .research-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def rows(table: str, limit: int = 500):
-    return store.list_rows(table, limit=limit)
+    try:
+        return store.list_rows(table, limit=limit)
+    except ValueError:
+        if table in OPTIONAL_DASHBOARD_TABLES:
+            logger.warning("Optional dashboard table is unavailable: %s", table)
+            return []
+        raise
 
 
 def df(table: str, limit: int = 500):
@@ -42,130 +372,1301 @@ def df(table: str, limit: int = 500):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
 
-st.title("SPY / QQQ / IWM Alert Bot")
-st.caption("Alert-only. Manual TradingView confirmation. No automated execution.")
+def parse_datetime(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TZ)
 
-tabs = st.tabs(
+
+def to_storage_datetime(local_date, local_time) -> datetime:
+    local_dt = datetime.combine(local_date, local_time).replace(tzinfo=DISPLAY_TZ)
+    return local_dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def optional_float(value):
+    value = float(value or 0)
+    return value if value > 0 else None
+
+
+def optional_confidence(value):
+    value = int(value or 0)
+    return value if value > 0 else None
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_text(value, default: str = "") -> str:
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    text = str(value or "").strip()
+    return text if text and text.lower() != "nan" else default
+
+
+def display_optional_number(value) -> str:
+    try:
+        if pd.isna(value):
+            return "-"
+    except TypeError:
+        pass
+    if value in (None, ""):
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def option_index(options, value, default: int = 0) -> int:
+    try:
+        return options.index(value)
+    except ValueError:
+        return default
+
+
+def rerun_dashboard() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
+
+def paper_summary_compat(store_obj, run_id=None, signal_source=None):
+    try:
+        return store_obj.paper_summary(run_id, signal_source=signal_source)
+    except TypeError:
+        return storage_module.SQLiteStore.paper_summary(
+            store_obj,
+            run_id=run_id,
+            signal_source=signal_source,
+        )
+
+
+def parse_date(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def relative_time(dt: datetime) -> str:
+    now = datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+    seconds = max((now - dt).total_seconds(), 0)
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 14:
+        return f"{days}d ago"
+    weeks = days // 7
+    if weeks < 10:
+        return f"{weeks}w ago"
+    months = days // 30
+    return f"{months}mo ago"
+
+
+def format_datetime(value, include_relative: bool = True) -> str:
+    dt = parse_datetime(value)
+    if not dt:
+        return "-"
+    label = dt.strftime("%b %-d, %Y at %-I:%M %p %Z")
+    if include_relative:
+        label = f"{label} ({relative_time(dt)})"
+    return label
+
+
+def format_date(value) -> str:
+    dt = parse_date(value)
+    return dt.strftime("%b %-d, %Y") if dt else "-"
+
+
+def readable_minutes(minutes_text: str) -> str:
+    minutes = float(minutes_text)
+    if minutes < 60:
+        return f"{int(minutes)} minutes old"
+    hours = int(minutes // 60)
+    if hours < 24:
+        return f"{hours} hours old"
+    days = int(hours // 24)
+    rem_hours = hours % 24
+    if rem_hours:
+        return f"{days} days, {rem_hours} hours old"
+    return f"{days} days old"
+
+
+def format_text_dates(text: str) -> str:
+    text = ISO_PATTERN.sub(lambda match: format_datetime(match.group(0)), str(text))
+    return MINUTES_PATTERN.sub(lambda match: readable_minutes(match.group(1)), text)
+
+
+def format_cadence(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def display_df(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    for column in out.columns:
+        if column in DATE_COLUMNS or column.endswith("_at"):
+            out[column] = out[column].apply(format_datetime)
+        elif column in DATE_ONLY_COLUMNS or column.endswith("_date"):
+            out[column] = out[column].apply(format_date)
+        elif column.endswith("_json"):
+            out[column] = out[column].astype(str).str.slice(0, 80)
+    out.columns = [column.replace("_", " ").title() for column in out.columns]
+    return out
+
+
+def show_table(frame: pd.DataFrame, *, height: Optional[int] = None) -> None:
+    st.dataframe(
+        display_df(frame),
+        width="stretch",
+        hide_index=True,
+        height=height,
+    )
+
+
+def tradingview_url(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={quote('AMEX:' + symbol)}"
+
+
+def link_action(label: str, url: str) -> None:
+    if hasattr(st, "link_button"):
+        st.link_button(label, url, use_container_width=True)
+    else:
+        st.markdown(f"[{escape(label)}]({url})")
+
+
+def status_class(status: str) -> str:
+    status = str(status or "").lower()
+    if status in {"ok", "running", "delivered", "alert_ready", "completed"}:
+        return "ok"
+    if status in {"fail", "failed", "error"}:
+        return "fail"
+    if status in {
+        "warn",
+        "warning",
+        "degraded",
+        "stopped",
+        "missing",
+        "missing_api_key",
+        "not_configured",
+        "disabled",
+    }:
+        return "warn"
+    return "info"
+
+
+def pill(label: str, status: str = "info") -> str:
+    return f'<span class="pill {status_class(status)}">{escape(str(label))}</span>'
+
+
+def confidence_status(confidence) -> str:
+    try:
+        value = int(confidence)
+    except (TypeError, ValueError):
+        return "info"
+    if value >= settings.alert_threshold:
+        return "ok"
+    if value >= 70:
+        return "warn"
+    return "info"
+
+
+def render_intro(health_status: str, scanner_running: bool) -> None:
+    scanner_label = "Scanner running" if scanner_running else "Scanner stopped"
+    st.markdown(
+        f"""
+        <div class="app-hero">
+          <div class="eyebrow">Alert-only trading assistant</div>
+          <div class="hero-title">SPY / QQQ / IWM</div>
+          <p class="hero-copy">Clean market context, A+ alert filtering, manual TradingView confirmation, and journaled discipline.</p>
+          <div class="status-row">
+            {pill("Dashboard " + str(health_status).upper(), health_status)}
+            {pill(scanner_label, "running" if scanner_running else "stopped")}
+            {pill("Telegram configured", "ok")}
+            {pill("No auto-trading", "info")}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_check_card(check: dict) -> None:
+    status = check.get("status", "info")
+    name = str(check.get("name", "")).replace("_", " ").title()
+    detail = format_text_dates(check.get("detail", ""))
+    st.markdown(
+        f"""
+        <div class="mini-card">
+          <div class="status-row" style="margin-top:0;">
+            {pill(name, status)}
+          </div>
+          <p class="card-meta" style="margin-top:8px;">{escape(detail)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def health_checks_by_name(health: dict) -> dict:
+    return {check.get("name"): check for check in health.get("checks", [])}
+
+
+def auto_recover_scanner_if_needed(health: dict, heartbeat: Optional[dict]):
+    checks = health_checks_by_name(health)
+    data_check = checks.get("data_freshness", {})
+    scanner_check = checks.get("scanner_heartbeat", {})
+    data_detail = str(data_check.get("detail") or "").lower()
+    scanner_detail = str(scanner_check.get("detail") or "").lower()
+    market_expected = "market data expected" in data_detail or "during configured" in scanner_detail
+    scanner_problem = scanner_check.get("status") == "warn" and any(
+        phrase in scanner_detail
+        for phrase in ("not running", "stopped", "stale")
+    )
+    if not market_expected or not scanner_problem:
+        return None
+
+    last_attempt = parse_datetime(st.session_state.get("scanner_auto_recovery_at"))
+    now = datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+    if last_attempt and (now - last_attempt).total_seconds() < 600:
+        return None
+
+    st.session_state["scanner_auto_recovery_at"] = datetime.utcnow().replace(microsecond=0).isoformat()
+    return recover_scanner_if_stale(
+        heartbeat["completed_at"] if heartbeat else None,
+        max(settings.scan_cadence_seconds * 3, 300),
+    )
+
+
+def render_setup_summary(row: Union[pd.Series, dict], *, compact: bool = False) -> None:
+    value = int(row.get("confidence", 0) or 0)
+    status = confidence_status(value)
+    source_label = setup_source_label(row)
+    symbol = safe_text(row.get("symbol"))
+    candle = latest_symbol_candle(symbol) if symbol else None
+    market_status = "warn"
+    if candle:
+        candle_dt = parse_datetime(candle.get("timestamp"))
+        age_minutes = (
+            max((datetime.now(timezone.utc).astimezone(DISPLAY_TZ) - candle_dt).total_seconds() / 60.0, 0.0)
+            if candle_dt
+            else float("inf")
+        )
+        market_status = "ok" if age_minutes <= settings.stale_data_minutes else "warn"
+    title = f"{row.get('symbol', '')} {row.get('direction', '')} {row.get('setup_type', '')}"
+    meta = (
+        f"Setup scan {format_datetime(row.get('created_at'))} | "
+        f"Risk/reward {float(row.get('risk_reward') or 0):.2f} | "
+        f"{row.get('market_condition', 'unknown')}"
+    )
+    market_meta = ""
+    if candle:
+        market_meta = (
+            f"Latest 1m close {safe_float(candle.get('close')):.2f} | "
+            f"{format_datetime(candle.get('timestamp'))}"
+        )
+    st.markdown(
+        f"""
+        <div class="mini-card">
+          <div class="status-row" style="margin-top:0;">
+            {pill(str(value) + "/100", status)}
+            {pill(row.get("status", "candidate"), row.get("status", "candidate"))}
+            {pill(source_label, "info")}
+            {pill("Market data updating", market_status)}
+          </div>
+          <p class="card-title">{escape(title)}</p>
+          <p class="card-meta">{escape(market_meta)}</p>
+          <p class="card-meta">{escape(meta)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.progress(min(max(value, 0), 100) / 100)
+    if not compact:
+        st.markdown(f'<p class="reason-text">{escape(str(row.get("reasoning", "")))}</p>', unsafe_allow_html=True)
+        avoid = row.get("avoid_if")
+        if avoid:
+            st.caption(f"Avoid if: {avoid}")
+
+
+def active_setup_window_minutes() -> float:
+    cadence_minutes = float(settings.scan_cadence_seconds) / 60.0
+    return max(20.0, cadence_minutes * 5.0)
+
+
+def setup_is_active(row: Union[pd.Series, dict]) -> bool:
+    created_at = parse_datetime(row.get("created_at"))
+    if not created_at:
+        return False
+    now = datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+    age_minutes = max((now - created_at).total_seconds() / 60.0, 0.0)
+    return age_minutes <= active_setup_window_minutes()
+
+
+def alert_is_active(row: Union[pd.Series, dict]) -> bool:
+    created_at = parse_datetime(row.get("created_at"))
+    if not created_at:
+        return False
+    if safe_int(row.get("delivered")) != 1:
+        return False
+    if safe_int(row.get("confidence")) < settings.alert_threshold:
+        return False
+    now = datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+    age_minutes = max((now - created_at).total_seconds() / 60.0, 0.0)
+    return age_minutes <= max(90.0, active_setup_window_minutes() * 3.0)
+
+
+def alert_still_matches_market(
+    alert_setup: Union[pd.Series, dict],
+    latest_context: Optional[Union[pd.Series, dict]],
+) -> bool:
+    if latest_context is None:
+        return True
+    try:
+        if int(latest_context.get("id") or 0) == int(alert_setup.get("id") or 0):
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    alert_time = parse_datetime(alert_setup.get("alert_created_at")) or parse_datetime(alert_setup.get("created_at"))
+    context_time = parse_datetime(latest_context.get("created_at"))
+    if alert_time and context_time and context_time <= alert_time:
+        return True
+
+    alert_direction = safe_text(alert_setup.get("direction")).upper()
+    context_direction = safe_text(latest_context.get("direction")).upper()
+    if alert_direction and context_direction and alert_direction != context_direction:
+        return False
+    return True
+
+
+def active_alert_setup_for_symbol(
+    alerts: pd.DataFrame,
+    setups: pd.DataFrame,
+    symbol: str,
+) -> Optional[pd.Series]:
+    if alerts.empty or setups.empty or "setup_id" not in alerts.columns or "id" not in setups.columns:
+        return None
+    symbol_alerts = alerts[alerts["symbol"] == symbol].copy()
+    if symbol_alerts.empty:
+        return None
+    symbol_alerts = symbol_alerts[symbol_alerts.apply(alert_is_active, axis=1)]
+    if symbol_alerts.empty:
+        return None
+    symbol_alerts = symbol_alerts.sort_values("created_at", ascending=False)
+    setup_lookup = setups.set_index("id", drop=False)
+    for _, alert in symbol_alerts.iterrows():
+        try:
+            setup_id = int(alert.get("setup_id"))
+        except (TypeError, ValueError):
+            continue
+        if setup_id not in setup_lookup.index:
+            continue
+        setup = setup_lookup.loc[setup_id].copy()
+        setup["alert_created_at"] = alert.get("created_at")
+        setup["alert_id"] = alert.get("id")
+        setup["delivered"] = alert.get("delivered")
+        return setup
+    return None
+
+
+def prioritize_market_setups(symbol_setups: pd.DataFrame) -> pd.DataFrame:
+    if symbol_setups.empty:
+        return symbol_setups
+    candidates = symbol_setups.copy()
+    candidates = candidates[candidates.apply(setup_is_active, axis=1)]
+    if candidates.empty:
+        return candidates
+    status_priority = {"alert_ready": 0, "watch_only": 1, "candidate": 2, "blocked": 3}
+    candidates["_status_priority"] = candidates["status"].map(status_priority).fillna(2)
+    candidates["_confidence_sort"] = pd.to_numeric(candidates["confidence"], errors="coerce").fillna(0)
+    return candidates.sort_values(
+        ["_status_priority", "_confidence_sort", "created_at"],
+        ascending=[True, False, False],
+    )
+
+
+def latest_symbol_scan_entry(heartbeat: Optional[dict], symbol: str) -> tuple:
+    if not heartbeat:
+        return "missing", "Scanner has not recorded a recent scan yet."
+    try:
+        summary = json.loads(heartbeat.get("summary_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        summary = {}
+    for key in ("no_trade", "watch_only", "errors", "alerts"):
+        prefixes = (f"{symbol}:", f"Core Model {symbol}:", f"Carter Squeeze {symbol}:")
+        for item in summary.get(key) or []:
+            text = str(item)
+            if text.startswith(prefixes):
+                return key, text
+    return "none", "No fresh setup candidate in the current scanner window."
+
+
+def latest_symbol_scan_note(heartbeat: Optional[dict], symbol: str) -> str:
+    return latest_symbol_scan_entry(heartbeat, symbol)[1]
+
+
+def heartbeat_no_trade_overrides_setup(
+    heartbeat: Optional[dict],
+    symbol: str,
+    setup: Optional[Union[pd.Series, dict]],
+) -> bool:
+    if setup is None:
+        return False
+    status = safe_text(setup.get("status"))
+    if status == "alert_ready":
+        return False
+    scan_key, _ = latest_symbol_scan_entry(heartbeat, symbol)
+    if scan_key != "no_trade":
+        return False
+    heartbeat_time = parse_datetime(heartbeat.get("completed_at") if heartbeat else None)
+    setup_time = parse_datetime(setup.get("created_at"))
+    return bool(heartbeat_time and setup_time and heartbeat_time > setup_time)
+
+
+def latest_symbol_candle(symbol: str, timeframe: str = "1m") -> Optional[dict]:
+    with store.connect() as conn:
+        row = conn.execute(
+            """
+            select timestamp, close, volume
+            from candles
+            where symbol = ? and timeframe = ?
+            order by timestamp desc
+            limit 1
+            """,
+            (symbol, timeframe),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def render_no_trade_card(symbol: str, note: str) -> None:
+    candle = latest_symbol_candle(symbol)
+    market_label = "Market data unavailable"
+    market_status = "warn"
+    if candle:
+        price = f"{safe_float(candle.get('close')):.2f}"
+        freshness = format_datetime(candle.get("timestamp"))
+        volume = f"{safe_int(candle.get('volume')):,}"
+        meta = f"Last 1m close {price} | {freshness} | Vol {volume}"
+        candle_dt = parse_datetime(candle.get("timestamp"))
+        if candle_dt:
+            age_minutes = max(
+                (datetime.now(timezone.utc).astimezone(DISPLAY_TZ) - candle_dt).total_seconds() / 60.0,
+                0.0,
+            )
+            if age_minutes <= settings.stale_data_minutes:
+                market_label = "Market data updating"
+                market_status = "ok"
+            else:
+                market_label = "Last stored market data"
+    else:
+        meta = "No recent 1m candle found."
+    st.markdown(
+        f"""
+        <div class="mini-card">
+          <div class="status-row" style="margin-top:0;">
+            {pill("NO TRADE", "warn")}
+            {pill(market_label, market_status)}
+          </div>
+          <p class="card-title">{escape(symbol)}: no fresh A+ setup</p>
+          <p class="card-meta">{escape(meta)}</p>
+          <p class="reason-text" style="margin:8px 0 0 0;">{escape(note)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def send_telegram_test_message() -> tuple:
+    telegram = TelegramClient()
+    result = telegram.send_message(
+        TELEGRAM_TEST_MESSAGE,
+        max_attempts=settings.telegram_max_attempts,
+        retry_delay_seconds=settings.telegram_retry_delay_seconds,
+    )
+    store.insert_telegram_attempt(
+        symbol="SYSTEM",
+        message=TELEGRAM_TEST_MESSAGE,
+        delivered=result.delivered,
+        attempt_number=result.attempts,
+        error=result.error,
+    )
+    return result.delivered, result.error
+
+
+def notification_diagnostics() -> dict:
+    with store.connect() as conn:
+        alerts = dict(
+            conn.execute(
+                "select count(*) as count, max(created_at) as latest from alerts"
+            ).fetchone()
+        )
+        attempts = dict(
+            conn.execute(
+                """
+                select count(*) as count, max(attempted_at) as latest,
+                       sum(case when delivered = 1 then 1 else 0 end) as delivered_count,
+                       sum(case when delivered = 0 then 1 else 0 end) as failed_count
+                from telegram_delivery_attempts
+                """
+            ).fetchone()
+        )
+        setups = dict(
+            conn.execute(
+                "select count(*) as count, max(created_at) as latest, max(confidence) as max_confidence from setups"
+            ).fetchone()
+        )
+        alert_ready = dict(
+            conn.execute(
+                """
+                select count(*) as count, max(created_at) as latest
+                from setups
+                where status = 'alert_ready' and confidence >= ?
+                """,
+                (settings.alert_threshold,),
+            ).fetchone()
+        )
+        blocked_near = dict(
+            conn.execute(
+                """
+                select count(*) as count, max(created_at) as latest
+                from setups
+                where status = 'blocked' and confidence >= ?
+                """,
+                (settings.alert_threshold - 1,),
+            ).fetchone()
+        )
+        latest_heartbeat = dict(
+            conn.execute(
+                """
+                select completed_at, status, alerts_count, watch_only_count, no_trade_count, errors_count
+                from scanner_heartbeats
+                order by id desc
+                limit 1
+                """
+            ).fetchone()
+            or {}
+        )
+        top_setup = dict(
+            conn.execute(
+                """
+                select created_at, symbol, setup_type, direction, confidence, status, market_condition
+                from setups
+                order by confidence desc, created_at desc
+                limit 1
+                """
+            ).fetchone()
+            or {}
+        )
+    return {
+        "alerts": alerts,
+        "attempts": attempts,
+        "setups": setups,
+        "alert_ready": alert_ready,
+        "blocked_near": blocked_near,
+        "latest_heartbeat": latest_heartbeat,
+        "top_setup": top_setup,
+    }
+
+
+def render_notification_diagnostics() -> None:
+    diagnostics = notification_diagnostics()
+    attempts = diagnostics["attempts"]
+    setups = diagnostics["setups"]
+    alert_ready = diagnostics["alert_ready"]
+    blocked_near = diagnostics["blocked_near"]
+    top_setup = diagnostics["top_setup"]
+    heartbeat = diagnostics["latest_heartbeat"]
+
+    st.subheader("Notification Diagnostics")
+    ncols = st.columns(5)
+    ncols[0].metric("Trade Alerts Sent", diagnostics["alerts"].get("count") or 0)
+    ncols[1].metric("Telegram Attempts", attempts.get("count") or 0)
+    ncols[2].metric("Delivered Tests/Alerts", attempts.get("delivered_count") or 0)
+    ncols[3].metric("Highest Score", f"{setups.get('max_confidence') or 0}/100")
+    ncols[4].metric("Alert Threshold", f"{settings.alert_threshold}/100")
+
+    if (alert_ready.get("count") or 0) == 0:
+        st.info(
+            "No Telegram trade alerts have been sent because no setup has reached "
+            f"alert-ready status at {settings.alert_threshold}/100 or higher."
+        )
+    if (blocked_near.get("count") or 0) > 0:
+        st.warning(
+            f"{blocked_near['count']} setup(s) reached {settings.alert_threshold - 1}/100 while blocked. "
+            "That usually means a no-trade filter, stale data, weak volume, opening range, or chop filter stopped it."
+        )
+    if top_setup:
+        with st.expander("Highest Recorded Setup"):
+            render_setup_summary(top_setup)
+            link_action(f"Open {top_setup['symbol']} Chart", tradingview_url(top_setup["symbol"]))
+    if heartbeat:
+        st.caption(
+            "Latest scan: "
+            f"{format_datetime(heartbeat.get('completed_at'))} | "
+            f"alerts {heartbeat.get('alerts_count', 0)} | "
+            f"watch-only {heartbeat.get('watch_only_count', 0)} | "
+            f"no-trade {heartbeat.get('no_trade_count', 0)} | "
+            f"errors {heartbeat.get('errors_count', 0)}"
+        )
+    st.caption(
+        f"This bot only sends trade alerts at {settings.alert_threshold}-100 confidence. "
+        "Watch-only setups stay in the dashboard."
+    )
+
+
+def parse_json_value(value, fallback):
+    if value in (None, ""):
+        return fallback
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def setup_features(row: Union[pd.Series, dict]) -> dict:
+    return parse_json_value(row.get("features_json"), {})
+
+
+def setup_source_label(row: Union[pd.Series, dict]) -> str:
+    features = setup_features(row)
+    return safe_text(features.get("source_label"), CORE_SOURCE_LABEL)
+
+
+def research_summary_with_fast_momentum_note(summary: str) -> str:
+    text = str(summary or "").strip()
+    enabled = bool(settings.strategy.get("fast_momentum_overrides_risk_blocks", False))
+    if not enabled or MOMENTUM_EXCEPTION_TITLE in text:
+        return text
+    if not text:
+        return MOMENTUM_EXCEPTION_NOTE
+    return f"{text}\n\n{MOMENTUM_EXCEPTION_NOTE}"
+
+
+def paper_metadata(row) -> dict:
+    return parse_json_value(row.get("metadata_json"), {})
+
+
+def paper_source_label(row) -> str:
+    metadata = paper_metadata(row)
+    return safe_text(metadata.get("source_label"), CORE_SOURCE_LABEL)
+
+
+def paper_target_label(row) -> str:
+    metadata = paper_metadata(row)
+    paper_target = metadata.get("paper_target1")
+    if paper_target not in (None, ""):
+        return f"{safe_float(paper_target):.2f}"
+    return f"{safe_float(row.get('target1')):.2f}"
+
+
+def paper_summary_row(label: str, summary: dict) -> dict:
+    closed = summary.get("win_rate_sample_size", summary.get("closed_alerted_count", 0))
+    return {
+        "Source": label,
+        "Alerts": summary.get("alerted_count", 0),
+        "Closed": closed,
+        "Win Rate": f"{summary.get('win_rate', 0):.1f}%" if closed else "No Closed",
+        "Total R": f"{summary.get('total_r', 0):.2f}",
+        "Profit Factor": summary.get("profit_factor", 0),
+        "Avg Winner": f"{summary.get('avg_winner_r', 0):.2f}R",
+        "Avg Loser": f"{summary.get('avg_loser_r', 0):.2f}R",
+        "Max DD": f"{summary.get('max_drawdown_r', 0):.2f}R",
+        "Expectancy": f"{summary.get('expectancy_r', 0):.2f}R",
+    }
+
+
+def latest_research_by_phase(session_date: Optional[str] = None) -> dict:
+    briefs = rows("research_briefs", 50)
+    if session_date:
+        briefs = [brief for brief in briefs if brief.get("session_date") == session_date]
+    by_phase = {}
+    for brief in sorted(briefs, key=lambda item: item.get("created_at", ""), reverse=True):
+        by_phase.setdefault(brief.get("phase"), brief)
+    return by_phase
+
+
+def current_research_phase_key() -> str:
+    now = datetime.now(ZoneInfo(settings.timezone))
+    return phase_for_datetime(now, settings.research.get("phase_times", {}))
+
+
+def run_research_from_dashboard(phase: str) -> str:
+    agent = ResearchAgent(settings, store)
+    result = agent.run_phase(phase, send_email=True)
+    if result.get("status") == "skipped":
+        return f"{PHASE_LABELS.get(phase, phase)} skipped: {result.get('reason')}"
+    email_status = result.get("email_status", "not_requested")
+    return (
+        f"{PHASE_LABELS.get(phase, phase)} saved. "
+        f"Decision {result.get('decision')} | risk {result.get('risk_score')}/100 | email {email_status}."
+    )
+
+
+def send_research_test_email() -> str:
+    result = ResearchAgent(settings, store).send_test_email()
+    if result.get("delivered"):
+        return "Research test email delivered."
+    if result.get("status") == "not_configured":
+        return f"Research email needs setup: {result.get('error')}"
+    return f"Research test email failed: {result.get('error')}"
+
+
+def source_chips(source_status: dict, brief: dict) -> str:
+    statuses = dict(source_status or {})
+    statuses.setdefault("openai_summary", brief.get("openai_status", "not_requested"))
+    statuses.setdefault("email_delivery", brief.get("email_status", "not_requested"))
+    if not bool(settings.openai_summary.get("enabled", True)):
+        statuses["openai_summary"] = "local_summary"
+    if missing_research_email_settings():
+        statuses["email_delivery"] = "not_configured"
+    else:
+        latest_email_status = latest_research_email_status()
+        if latest_email_status:
+            statuses["email_delivery"] = latest_email_status
+    labels = {
+        "economic_calendar": "Fed/BLS calendar",
+        "market_structure": "SPY/QQQ/IWM",
+        "volatility": "VIX",
+        "news_sentiment": "News",
+        "earnings_options": "Earnings/options",
+        "fear_greed_proxy": "Fear/greed",
+        "openai_summary": "OpenAI summary",
+        "email_delivery": "Email",
+    }
+    return " ".join(
+        pill(f"{labels.get(key, key)}: {source_status_label(status, key)}", status)
+        for key, status in statuses.items()
+    )
+
+
+def source_status_label(status: str, source: str = "") -> str:
+    value = str(status or "unknown").replace("_", " ").strip().title()
+    if status == "ok":
+        return "OK"
+    if status == "missing" and source == "news_sentiment":
+        return "Needs Key"
+    if status == "missing_api_key" and source == "openai_summary":
+        return "Needs OpenAI Key"
+    if status in {"disabled", "local_summary"} and source == "openai_summary":
+        return "Local Summary"
+    if status == "not_configured" and source == "email_delivery":
+        return "Needs Setup"
+    if status == "ready" and source == "email_delivery":
+        return "Ready"
+    if status == "not_requested":
+        return "Not Run"
+    return value or "Unknown"
+
+
+def latest_research_email_status() -> Optional[str]:
+    attempts = rows("research_email_attempts", 1)
+    if not attempts:
+        return "ready"
+    return "delivered" if int(attempts[0].get("delivered") or 0) else "failed"
+
+
+def missing_research_email_settings() -> list:
+    if not bool(settings.email.get("enabled", True)):
+        return []
+    return GmailSMTPClient(settings).validate_configuration()
+
+
+def research_setup_warnings() -> list:
+    warnings = []
+    if bool(settings.openai_summary.get("enabled", True)) and not os.environ.get("OPENAI_API_KEY"):
+        warnings.append(
+            "OpenAI summary needs OPENAI_API_KEY in .env. Until then, the bot uses the safe local summary."
+        )
+    missing_email = missing_research_email_settings()
+    if missing_email:
+        warnings.append(
+            "Email needs setup: "
+            + ", ".join(missing_email)
+            + ". Research emails will not send until these are added to .env."
+        )
+    return warnings
+
+
+def render_research_phase_card(phase: str, brief: Optional[dict]) -> None:
+    label = PHASE_LABELS.get(phase, phase.title())
+    if not brief:
+        st.markdown(
+            f"""
+            <div class="mini-card">
+              <p class="card-title">{escape(label)}</p>
+              <p class="card-meta">No brief recorded yet.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    drivers = parse_json_value(brief.get("drivers_json"), [])
+    risk_warnings = parse_json_value(brief.get("hard_blocks_json"), [])
+    st.markdown(
+        f"""
+        <div class="mini-card">
+          <div class="status-row" style="margin-top:0;">
+            {pill(label, brief.get("decision", "info"))}
+            {pill(str(brief.get("risk_score", "-")) + "/100 risk", "fail" if int(brief.get("risk_score") or 0) >= 65 else "warn" if int(brief.get("risk_score") or 0) >= 40 else "ok")}
+            {pill(str(brief.get("bias", "neutral")), "info")}
+          </div>
+          <p class="card-meta">{escape(format_datetime(brief.get("created_at")))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    for driver in drivers[:3]:
+        st.caption(driver)
+    if risk_warnings:
+        st.warning("Risk warning: " + " | ".join(str(block) for block in risk_warnings[:2]))
+
+
+def render_research_tab() -> None:
+    message = st.session_state.pop("research_action_message", None)
+    if message:
+        st.info(message)
+
+    session_date = current_session_date(settings).isoformat()
+    by_phase = latest_research_by_phase(session_date)
+    current_phase_key = current_research_phase_key()
+    latest = by_phase.get(current_phase_key) or store.latest_research_brief(session_date=session_date)
+    st.subheader("Research")
+    st.caption(
+        "Research phase cards are snapshots. Updating a phase overwrites that phase with the market conditions at the time you run it."
+    )
+    for setup_warning in research_setup_warnings():
+        st.warning(setup_warning)
+
+    if not latest:
+        st.info("No market research brief has been generated yet.")
+        latest = {}
+
+    trade_today = bool(latest.get("trade_today")) if latest else False
+    decision_label = "Yes" if trade_today else "No"
+    current_phase = PHASE_LABELS.get(str(latest.get("phase", "")), "-") if latest else "-"
+    risk_value = f"{latest.get('risk_score', '-')}/100" if latest else "-"
+    bias_value = str(latest.get("bias", "-")).title() if latest else "-"
+    snapshot_time = format_datetime(latest.get("created_at")) if latest else "-"
+    st.markdown(
+        f"""
+        <div class="research-grid">
+          <div class="research-metric">
+            <p class="research-metric-label">Trade Today?</p>
+            <p class="research-metric-value">{escape(decision_label)}</p>
+          </div>
+          <div class="research-metric">
+            <p class="research-metric-label">Risk Score</p>
+            <p class="research-metric-value">{escape(risk_value)}</p>
+          </div>
+          <div class="research-metric">
+            <p class="research-metric-label">Bias</p>
+            <p class="research-metric-value">{escape(bias_value)}</p>
+          </div>
+          <div class="research-metric">
+            <p class="research-metric-label">Active Snapshot</p>
+            <p class="research-metric-value">{escape(current_phase)}</p>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Active research snapshot saved: {snapshot_time}")
+
+    if latest:
+        source_status = parse_json_value(latest.get("source_status_json"), {})
+        research_summary = research_summary_with_fast_momentum_note(str(latest.get("summary", "")))
+        st.markdown(
+            f"""
+            <div class="mini-card">
+              <p class="card-title">Why This Matters</p>
+              <p class="reason-text">{escape(research_summary)}</p>
+              <div class="status-row">{source_chips(source_status, latest)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    allow_non_current_phase_update = st.checkbox(
+        "Allow overwriting a non-current phase snapshot",
+        value=False,
+        help="Use this only when you intentionally want to replace an old phase with the current market snapshot.",
+    )
+    action_cols = st.columns(len(PHASES) + 1)
+    for index, phase in enumerate(PHASES):
+        is_current_phase = phase == current_phase_key
+        disabled = not is_current_phase and not allow_non_current_phase_update
+        label = (
+            f"Run Current {PHASE_LABELS[phase]}"
+            if is_current_phase
+            else f"Overwrite {PHASE_LABELS[phase]}"
+        )
+        if action_cols[index].button(
+            label,
+            use_container_width=True,
+            key=f"research_run_{phase}",
+            disabled=disabled,
+        ):
+            st.session_state["research_action_message"] = run_research_from_dashboard(phase)
+            st.rerun()
+    if action_cols[len(PHASES)].button("Send Test Email", use_container_width=True, key="research_test_email"):
+        st.session_state["research_action_message"] = send_research_test_email()
+        st.rerun()
+
+    phase_cols = st.columns(len(PHASES))
+    for index, phase in enumerate(PHASES):
+        with phase_cols[index]:
+            render_research_phase_card(phase, by_phase.get(phase))
+
+    if latest:
+        with st.expander("Raw Research Evidence"):
+            evidence = parse_json_value(latest.get("evidence_json"), [])
+            if evidence:
+                show_table(pd.DataFrame(evidence), height=360)
+            else:
+                st.info("No raw evidence recorded.")
+
+
+health_preview = run_healthcheck(settings, store)
+heartbeat_preview = store.latest_scan_heartbeat()
+scanner_stale_after_seconds = max(settings.scan_cadence_seconds * 10, 1800)
+scanner_recovery_status = auto_recover_scanner_if_needed(health_preview, heartbeat_preview)
+if scanner_recovery_status:
+    heartbeat_preview = store.latest_scan_heartbeat()
+    health_preview = run_healthcheck(settings, store)
+process_preview = reconcile_scanner_status(
+    heartbeat_preview["completed_at"] if heartbeat_preview else None,
+    scanner_stale_after_seconds,
+)
+
+inject_styles()
+render_intro(health_preview["status"], process_preview.running)
+if scanner_recovery_status:
+    st.info(f"Scanner recovery: {scanner_recovery_status.message}")
+
+(
+    health_tab,
+    research_tab,
+    market_tab,
+    alerts_tab,
+    journal_tab,
+    performance_tab,
+    breakdowns_tab,
+    paper_tab,
+    improve_tab,
+) = st.tabs(
     [
         "Health",
-        "Market Monitor",
+        "Research",
+        "Market",
         "Alerts",
         "Journal",
         "Performance",
         "Breakdowns",
-        "Paper Trading",
-        "Improvement Lab",
+        "Paper",
+        "Improve",
     ]
 )
 
-with tabs[0]:
+with health_tab:
+    st.subheader("Scanner Controls")
+    heartbeat = store.latest_scan_heartbeat()
+    process_status = reconcile_scanner_status(
+        heartbeat["completed_at"] if heartbeat else None,
+        scanner_stale_after_seconds,
+    )
+    control_message = None
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    if c1.button("Start Scanner", use_container_width=True, key="health_start_scanner"):
+        result = start_scanner()
+        control_message = ("success" if result.running else "warning", result.message)
+    if c2.button("Stop Scanner", use_container_width=True, key="health_stop_scanner"):
+        result = stop_scanner()
+        control_message = ("success", result.message)
+    if c3.button("Run Scan Now", use_container_width=True, key="health_run_scan_now"):
+        with st.spinner("Running one scanner cycle..."):
+            result = run_scan_once()
+        if result.returncode == 0:
+            st.success("Scan completed.")
+        else:
+            st.error("Scan failed.")
+        if result.stdout:
+            st.code(result.stdout)
+        if result.stderr:
+            st.code(result.stderr)
+    if c4.button("Refresh Status", use_container_width=True, key="health_refresh_status"):
+        control_message = ("success", "scanner status refreshed")
+    if c5.button("Send Test", use_container_width=True, key="health_send_telegram_test"):
+        delivered, error = send_telegram_test_message()
+        if delivered:
+            control_message = ("success", "Telegram test delivered.")
+        else:
+            control_message = ("warning", f"Telegram test failed: {error}")
+
+    heartbeat = store.latest_scan_heartbeat()
+    process_status = reconcile_scanner_status(
+        heartbeat["completed_at"] if heartbeat else None,
+        scanner_stale_after_seconds,
+    )
+    pcols = st.columns(5)
+    pcols[0].metric("Scanner", "Running" if process_status.running else "Stopped")
+    pcols[1].metric("PID", process_status.pid or "-")
+    pcols[2].metric("Last Scan", format_datetime(heartbeat["completed_at"]) if heartbeat else "-")
+    pcols[3].metric("Cadence", format_cadence(int(settings.scan_cadence_seconds)))
+    pcols[4].metric("Alert Frames", ", ".join(settings.alert_timeframes))
+    st.caption(f"Process log: {process_status.log_file}")
+
+    if control_message:
+        level, message = control_message
+        if level == "success":
+            st.success(message)
+        else:
+            st.warning(message)
+
     st.subheader("Runtime Health")
     health = run_healthcheck(settings, store)
-    st.metric("Status", health["status"].upper())
-    st.dataframe(pd.DataFrame(health["checks"]), width="stretch", hide_index=True)
+    hcols = st.columns(3)
+    hcols[0].metric("System", health["status"].upper())
+    hcols[1].metric("Checked", format_datetime(health["checked_at"]))
+    hcols[2].metric("Database", Path(health["database"]).name)
 
-    st.subheader("Scanner Heartbeats")
-    heartbeats = df("scanner_heartbeats", 20)
-    if heartbeats.empty:
-        st.info("No scanner heartbeat recorded yet.")
-    else:
-        st.dataframe(heartbeats, width="stretch", hide_index=True)
+    for check in health["checks"]:
+        render_check_card(check)
 
-with tabs[1]:
+    render_notification_diagnostics()
+
+    with st.expander("Recent Scanner Heartbeats"):
+        heartbeats = df("scanner_heartbeats", 20)
+        if heartbeats.empty:
+            st.info("No scanner heartbeat recorded yet.")
+        else:
+            show_table(
+                heartbeats[
+                    [
+                        "completed_at",
+                        "status",
+                        "alerts_count",
+                        "watch_only_count",
+                        "no_trade_count",
+                        "errors_count",
+                    ]
+                ],
+                height=360,
+            )
+
+with research_tab:
+    render_research_tab()
+
+with market_tab:
     st.subheader("Market Monitor")
-    latest_setups = df("setups", 100)
-    latest_levels = df("levels", 200)
+    latest_setups = df("setups", 300)
+    latest_alerts = df("alerts", 200)
+    latest_levels = df("levels", 240)
     latest_reviews = df("daily_market_reviews", 30)
+    latest_heartbeat = store.latest_scan_heartbeat()
+
+    chart_cols = st.columns(len(settings.symbols))
+    for index, symbol in enumerate(settings.symbols):
+        with chart_cols[index]:
+            link_action(f"Open {symbol} Chart", tradingview_url(symbol))
 
     cols = st.columns(3)
     for idx, symbol in enumerate(settings.symbols):
-        symbol_setups = latest_setups[latest_setups["symbol"] == symbol] if not latest_setups.empty else pd.DataFrame()
-        symbol_levels = latest_levels[latest_levels["symbol"] == symbol] if not latest_levels.empty else pd.DataFrame()
+        symbol_setups = (
+            latest_setups[latest_setups["symbol"] == symbol]
+            if not latest_setups.empty
+            else pd.DataFrame()
+        )
+        if not symbol_setups.empty:
+            symbol_setups = prioritize_market_setups(symbol_setups)
+        active_alert_setup = active_alert_setup_for_symbol(latest_alerts, latest_setups, symbol)
+        latest_context = symbol_setups.iloc[0] if not symbol_setups.empty else None
+        no_trade_overrides_context = heartbeat_no_trade_overrides_setup(
+            latest_heartbeat,
+            symbol,
+            latest_context,
+        )
+        if no_trade_overrides_context:
+            latest_context = None
+            symbol_setups = pd.DataFrame()
+        if active_alert_setup is not None and not alert_still_matches_market(active_alert_setup, latest_context):
+            active_alert_setup = None
+        symbol_levels = (
+            latest_levels[latest_levels["symbol"] == symbol]
+            if not latest_levels.empty
+            else pd.DataFrame()
+        )
         with cols[idx]:
-            st.metric(symbol, "Watching")
-            if not symbol_setups.empty:
-                top = symbol_setups.sort_values("created_at", ascending=False).iloc[0]
-                st.write(f"Bias setup: {top['direction']} {top['setup_type']}")
-                st.write(f"Confidence: {top['confidence']}/100")
-                st.write(f"Condition: {top['market_condition']}")
-            else:
-                st.write("No setup candidates recorded yet.")
-            if not symbol_levels.empty:
-                compact = symbol_levels[["name", "price", "timeframe"]].head(8)
-                st.dataframe(compact, width="stretch", hide_index=True)
+            st.markdown(f"### {symbol}")
+            setup_view, alert_view, levels_view = st.tabs(["Current Setup", "Active Alert", "Levels"])
+            with setup_view:
+                if latest_context is not None:
+                    render_setup_summary(latest_context, compact=True)
+                    with st.expander("Current Setup Details"):
+                        render_setup_summary(latest_context)
+                        link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
+                else:
+                    render_no_trade_card(symbol, latest_symbol_scan_note(latest_heartbeat, symbol))
+            with alert_view:
+                if active_alert_setup is not None:
+                    st.caption(
+                        f"Active Telegram alert from {format_datetime(active_alert_setup.get('alert_created_at'))}"
+                    )
+                    render_setup_summary(active_alert_setup, compact=True)
+                    with st.expander("Active Alert Details"):
+                        render_setup_summary(active_alert_setup)
+                        link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
+                else:
+                    st.info("No active Telegram alert for this symbol.")
+                    st.caption(latest_symbol_scan_note(latest_heartbeat, symbol))
+                    link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
+            with levels_view:
+                if symbol_levels.empty:
+                    st.info("No key levels recorded yet.")
+                else:
+                    compact = symbol_levels[["name", "price", "timeframe", "session_date"]].head(8)
+                    show_table(compact, height=260)
+                    link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
 
     st.subheader("No-Trade / Daily Review")
     if latest_reviews.empty:
         st.info("No daily market reviews recorded yet.")
     else:
-        st.dataframe(latest_reviews, width="stretch", hide_index=True)
+        show_table(latest_reviews.sort_values("created_at", ascending=False), height=340)
 
-with tabs[2]:
-    st.subheader("Recent Alerts")
+with alerts_tab:
+    st.subheader("Alerts")
     alerts = df("alerts", 200)
     setups = df("setups", 300)
+    attempts = df("telegram_delivery_attempts", 200)
+
     if alerts.empty:
         st.info("No Telegram alerts have been recorded yet.")
     else:
-        st.dataframe(alerts.sort_values("created_at", ascending=False), width="stretch", hide_index=True)
+        recent_alerts = alerts.sort_values("created_at", ascending=False).head(20)
+        for _, alert in recent_alerts.iterrows():
+            title = (
+                f"{alert['symbol']} {alert['direction']} | "
+                f"{alert['confidence']}/100 | {format_datetime(alert['created_at'])}"
+            )
+            with st.expander(title):
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Setup", alert["setup_type"])
+                a2.metric("Confidence", f"{alert['confidence']}/100")
+                a3.metric("Delivered", "Yes" if int(alert["delivered"]) else "No")
+                link_action(f"Open {alert['symbol']} Chart", tradingview_url(alert["symbol"]))
+                st.text(alert["message"])
+
     st.subheader("Watch-Only Setups")
     if setups.empty:
         st.info("No setup candidates yet.")
     else:
-        watch = setups.sort_values("created_at", ascending=False)
-        st.dataframe(
-            watch[
-                [
-                    "created_at",
-                    "symbol",
-                    "setup_type",
-                    "direction",
-                    "confidence",
-                    "risk_reward",
-                    "status",
-                    "market_condition",
-                    "reasoning",
-                ]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
+        watch = setups.sort_values("created_at", ascending=False).head(25)
+        for _, setup in watch.iterrows():
+            title = (
+                f"{setup['symbol']} {setup['direction']} {setup['setup_type']} | "
+                f"{setup['confidence']}/100 | {format_datetime(setup['created_at'])}"
+            )
+            with st.expander(title):
+                render_setup_summary(setup)
+                link_action(f"Open {setup['symbol']} Chart", tradingview_url(setup["symbol"]))
 
-    st.subheader("Telegram Delivery Attempts")
-    attempts = df("telegram_delivery_attempts", 200)
-    if attempts.empty:
-        st.info("No Telegram delivery attempts recorded yet.")
-    else:
-        st.dataframe(
-            attempts.sort_values("attempted_at", ascending=False),
-            width="stretch",
-            hide_index=True,
-        )
+    with st.expander("Telegram Delivery Attempts"):
+        if attempts.empty:
+            st.info("No Telegram delivery attempts recorded yet.")
+        else:
+            show_table(attempts.sort_values("attempted_at", ascending=False), height=360)
 
     st.subheader("Alert Review")
     if alerts.empty:
         st.info("No alert to review yet.")
     else:
-        alert_ids = alerts.sort_values("created_at", ascending=False)["id"].tolist()
+        alert_options = alerts.sort_values("created_at", ascending=False).copy()
+        alert_options["label"] = alert_options.apply(
+            lambda row: (
+                f"#{row['id']} {row['symbol']} {row['direction']} "
+                f"{row['confidence']}/100 - {format_datetime(row['created_at'])}"
+            ),
+            axis=1,
+        )
         with st.form("alert_review_form", clear_on_submit=True):
-            alert_id = st.selectbox("Alert", alert_ids)
+            alert_label = st.selectbox("Alert", alert_options["label"].tolist(), key="alert_review_alert")
+            alert_id = int(alert_options[alert_options["label"] == alert_label].iloc[0]["id"])
             col1, col2, col3 = st.columns(3)
-            review_status = col1.selectbox("Status", ["needs_review", "taken", "ignored", "avoided"])
-            outcome = col2.selectbox("Outcome", ["pending", "win", "loss", "breakeven", "not_triggered"])
-            r_multiple = col3.number_input("R multiple", step=0.25)
-            emotional_state = st.text_input("Review emotional state")
+            review_status = col1.selectbox("Status", ["needs_review", "taken", "ignored", "avoided"], key="alert_review_status")
+            outcome = col2.selectbox("Outcome", ["pending", "win", "loss", "breakeven", "not_triggered"], key="alert_review_outcome")
+            r_multiple = col3.number_input("R multiple", step=0.25, key="alert_review_r_multiple")
+            emotional_state = st.text_input("Review emotional state", key="alert_review_emotional_state")
             mistake_tags = st.multiselect(
                 "Review mistake tags",
-                [
-                    "FOMO",
-                    "revenge trade",
-                    "oversized position",
-                    "poor entry",
-                    "ignored stop",
-                    "emotional trade",
-                ],
+                MISTAKE_TAG_OPTIONS,
+                key="alert_review_mistake_tags",
             )
-            notes = st.text_area("Alert review notes")
+            notes = st.text_area("Alert review notes", key="alert_review_notes")
             submitted = st.form_submit_button("Save Alert Review")
             if submitted:
                 store.upsert_alert_review(
@@ -182,36 +1683,181 @@ with tabs[2]:
 
     reviews = df("alert_reviews", 200)
     if not reviews.empty:
-        st.dataframe(reviews, width="stretch", hide_index=True)
+        with st.expander("Saved Alert Reviews"):
+            show_table(reviews.sort_values("reviewed_at", ascending=False), height=360)
 
-with tabs[3]:
+with journal_tab:
     st.subheader("Manual Trade Journal")
+    if st.session_state.get("journal_flash"):
+        st.success(st.session_state.pop("journal_flash"))
+
+    st.markdown("### Eva's Index Alert Trading Bot Commandments")
+    st.caption("Capture what you are learning, then promote the strongest rules into your permanent trading commandments.")
+    rules = list_trading_rule_entries(store)
+    commandments = [
+        rule
+        for rule in rules
+        if safe_text(rule.get("status")) == "commandment"
+    ]
+    commandments = sorted(
+        commandments,
+        key=lambda rule: (
+            safe_int(rule.get("commandment_order")) or 99,
+            safe_text(rule.get("updated_at")),
+        ),
+    )[:10]
+
+    if commandments:
+        st.markdown("#### Eva's 10 Commandments")
+        for index, rule in enumerate(commandments, start=1):
+            order = safe_int(rule.get("commandment_order")) or index
+            st.markdown(f"**{order}.** {safe_text(rule.get('rule_text'))}")
+            notes_text = safe_text(rule.get("notes"))
+            if notes_text:
+                st.caption(notes_text)
+    else:
+        st.info("No commandments yet. Add a rule below and mark it as a commandment when it earns a permanent spot.")
+
+    with st.form("trading_rule_form", clear_on_submit=True):
+        rule_text = st.text_area(
+            "New rule or lesson",
+            placeholder="Example: I do not trade the first 15 minutes unless structure is extremely clean.",
+            key="trading_rule_text",
+        )
+        rule_cols = st.columns(3)
+        rule_category = rule_cols[0].selectbox(
+            "Category",
+            ["when_to_trade", "when_not_to_trade", "risk_management", "psychology", "execution"],
+            key="trading_rule_category",
+        )
+        make_commandment = rule_cols[1].checkbox(
+            "Add to commandments",
+            key="trading_rule_make_commandment",
+        )
+        commandment_order = rule_cols[2].number_input(
+            "Commandment number",
+            min_value=1,
+            max_value=10,
+            value=min(len(commandments) + 1, 10),
+            step=1,
+            disabled=not make_commandment,
+            key="trading_rule_order",
+        )
+        rule_notes = st.text_input(
+            "Why this rule matters",
+            key="trading_rule_notes",
+        )
+        save_rule = st.form_submit_button("Save Rule")
+        if save_rule:
+            if not rule_text.strip():
+                st.warning("Type the rule before saving it.")
+            else:
+                add_trading_rule_entry(
+                    store,
+                    rule_text=rule_text,
+                    category=rule_category,
+                    status="commandment" if make_commandment else "draft",
+                    commandment_order=int(commandment_order) if make_commandment else None,
+                    notes=rule_notes,
+                )
+                st.session_state["journal_flash"] = "Trading rule saved."
+                st.cache_resource.clear()
+                rerun_dashboard()
+
+    if rules:
+        with st.expander("Rule Library", expanded=False):
+            for rule in rules:
+                rule_id = int(rule["id"])
+                with st.form(f"trading_rule_edit_{rule_id}"):
+                    current_status = safe_text(rule.get("status"), "draft")
+                    current_category = safe_text(rule.get("category"), "when_to_trade")
+                    category_options = [
+                        "when_to_trade",
+                        "when_not_to_trade",
+                        "risk_management",
+                        "psychology",
+                        "execution",
+                    ]
+                    status_options = ["draft", "commandment", "retired"]
+                    edited_text = st.text_area(
+                        f"Rule #{rule_id}",
+                        value=safe_text(rule.get("rule_text")),
+                        key=f"trading_rule_text_{rule_id}",
+                    )
+                    edit_cols = st.columns(4)
+                    edited_category = edit_cols[0].selectbox(
+                        "Category",
+                        category_options,
+                        index=option_index(category_options, current_category),
+                        key=f"trading_rule_category_{rule_id}",
+                    )
+                    edited_status = edit_cols[1].selectbox(
+                        "Status",
+                        status_options,
+                        index=option_index(status_options, current_status),
+                        key=f"trading_rule_status_{rule_id}",
+                    )
+                    edited_order = edit_cols[2].number_input(
+                        "Commandment number",
+                        min_value=1,
+                        max_value=10,
+                        value=safe_int(rule.get("commandment_order")) or 1,
+                        step=1,
+                        disabled=edited_status != "commandment",
+                        key=f"trading_rule_order_{rule_id}",
+                    )
+                    delete_rule = edit_cols[3].checkbox(
+                        "Remove",
+                        key=f"trading_rule_delete_{rule_id}",
+                    )
+                    edited_notes = st.text_input(
+                        "Why this rule matters",
+                        value=safe_text(rule.get("notes")),
+                        key=f"trading_rule_notes_{rule_id}",
+                    )
+                    save_rule_edit = st.form_submit_button("Save Rule Changes")
+                    if save_rule_edit:
+                        if delete_rule:
+                            delete_trading_rule_entry(store, rule_id)
+                            st.session_state["journal_flash"] = f"Rule #{rule_id} removed."
+                        elif not edited_text.strip():
+                            st.warning("Rule text cannot be blank.")
+                        else:
+                            update_trading_rule_entry(
+                                store,
+                                rule_id=rule_id,
+                                rule_text=edited_text,
+                                category=edited_category,
+                                status=edited_status,
+                                commandment_order=int(edited_order) if edited_status == "commandment" else None,
+                                notes=edited_notes,
+                            )
+                            st.session_state["journal_flash"] = f"Rule #{rule_id} updated."
+                        st.cache_resource.clear()
+                        rerun_dashboard()
+
+    st.divider()
+
     with st.form("trade_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
-        symbol = col1.selectbox("Ticker", settings.symbols)
-        setup_type = col2.text_input("Setup type", "manual")
-        direction = col3.selectbox("Direction", ["LONG", "SHORT"])
+        symbol = col1.selectbox("Ticker", settings.symbols, key="trade_symbol")
+        setup_type = col2.text_input("Setup type", "manual", key="trade_setup_type")
+        direction = col3.selectbox("Direction", ["LONG", "SHORT"], key="trade_direction")
         col4, col5, col6 = st.columns(3)
-        entry_price = col4.number_input("Entry price", min_value=0.0, step=0.01)
-        exit_price = col5.number_input("Exit price", min_value=0.0, step=0.01)
-        quantity = col6.number_input("Contracts / shares", min_value=0.0, step=1.0)
+        entry_price = col4.number_input("Entry price", min_value=0.0, step=0.01, key="trade_entry_price")
+        exit_price = col5.number_input("Exit price", min_value=0.0, step=0.01, key="trade_exit_price")
+        quantity = col6.number_input("Contracts / shares", min_value=0.0, step=1.0, key="trade_quantity")
         col7, col8, col9 = st.columns(3)
-        realized_pl = col7.number_input("Realized P/L", step=1.0)
-        confidence = col8.number_input("Alert confidence", min_value=0, max_value=100, value=0)
-        market_condition = col9.text_input("Market condition", "unknown")
-        emotional_state = st.text_input("Emotional state")
+        realized_pl = col7.number_input("Realized P/L", step=1.0, key="trade_realized_pl")
+        confidence = col8.number_input("Alert confidence", min_value=0, max_value=100, value=0, key="trade_confidence")
+        market_condition = col9.text_input("Market condition", "unknown", key="trade_market_condition")
+        emotional_state = st.text_input("Emotional state", key="trade_emotional_state")
         mistake_tags = st.multiselect(
             "Mistake tags",
-            [
-                "FOMO",
-                "revenge trade",
-                "oversized position",
-                "poor entry",
-                "ignored stop",
-                "emotional trade",
-            ],
+            MISTAKE_TAG_OPTIONS,
+            key="trade_mistake_tags",
         )
-        notes = st.text_area("Notes / lesson learned")
+        notes = st.text_area("Notes / lesson learned", key="trade_notes")
         submitted = st.form_submit_button("Add Trade")
         if submitted:
             journal.add_trade(
@@ -237,22 +1883,220 @@ with tabs[3]:
     if trades.empty:
         st.info("No trades journaled yet.")
     else:
-        st.dataframe(trades.sort_values("opened_at", ascending=False), width="stretch", hide_index=True)
+        recent_trades = trades.sort_values("opened_at", ascending=False).head(30)
+        for _, trade in recent_trades.iterrows():
+            trade_id = int(trade["id"])
+            pl = safe_float(trade.get("realized_pl"))
+            title = (
+                f"#{trade_id} {trade['symbol']} {trade['direction']} | "
+                f"${pl:,.2f} | {format_datetime(trade['opened_at'])}"
+            )
+            with st.expander(title):
+                t1, t2, t3, t4 = st.columns(4)
+                t1.metric("Setup", trade["setup_type"])
+                t2.metric("P/L", f"${pl:,.2f}")
+                t3.metric("Entry", display_optional_number(trade.get("entry_price")))
+                t4.metric("Exit", display_optional_number(trade.get("exit_price")))
+                st.write(safe_text(trade.get("notes"), "No notes."))
+                emotional_label = safe_text(trade.get("emotional_state"))
+                if emotional_label:
+                    st.caption(f"Emotional state: {emotional_label}")
+                link_action(f"Open {trade['symbol']} Chart", tradingview_url(trade["symbol"]))
 
-with tabs[4]:
+                st.divider()
+                st.markdown("#### Edit Entry")
+                opened_local = parse_datetime(trade.get("opened_at")) or datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+                closed_local = parse_datetime(trade.get("closed_at"))
+                closed_default = closed_local or datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
+                saved_tags = [str(tag) for tag in parse_json_value(trade.get("mistake_tags_json"), [])]
+                tag_options = list(dict.fromkeys(MISTAKE_TAG_OPTIONS + saved_tags))
+                symbol_options = list(dict.fromkeys(settings.symbols + [safe_text(trade.get("symbol"))]))
+                direction_options = list(dict.fromkeys(["LONG", "SHORT", safe_text(trade.get("direction"), "LONG")]))
+
+                with st.form(f"edit_trade_form_{trade_id}"):
+                    edit_cols = st.columns(3)
+                    edit_symbol = edit_cols[0].selectbox(
+                        "Ticker",
+                        symbol_options,
+                        index=option_index(symbol_options, safe_text(trade.get("symbol"), settings.symbols[0])),
+                        key=f"edit_trade_symbol_{trade_id}",
+                    )
+                    edit_setup_type = edit_cols[1].text_input(
+                        "Setup type",
+                        value=safe_text(trade.get("setup_type"), "manual"),
+                        key=f"edit_trade_setup_{trade_id}",
+                    )
+                    edit_direction = edit_cols[2].selectbox(
+                        "Direction",
+                        direction_options,
+                        index=option_index(direction_options, safe_text(trade.get("direction"), "LONG")),
+                        key=f"edit_trade_direction_{trade_id}",
+                    )
+
+                    time_cols = st.columns(4)
+                    opened_date = time_cols[0].date_input(
+                        "Opened date",
+                        value=opened_local.date(),
+                        key=f"edit_trade_opened_date_{trade_id}",
+                    )
+                    opened_time = time_cols[1].time_input(
+                        "Opened time",
+                        value=opened_local.time().replace(microsecond=0),
+                        key=f"edit_trade_opened_time_{trade_id}",
+                    )
+                    is_closed = time_cols[2].checkbox(
+                        "Closed",
+                        value=closed_local is not None,
+                        key=f"edit_trade_is_closed_{trade_id}",
+                    )
+                    took_trade = time_cols[3].checkbox(
+                        "I took this trade",
+                        value=bool(safe_int(trade.get("took_trade"))),
+                        key=f"edit_trade_took_{trade_id}",
+                    )
+
+                    close_cols = st.columns(2)
+                    closed_date = close_cols[0].date_input(
+                        "Closed date",
+                        value=closed_default.date(),
+                        disabled=not is_closed,
+                        key=f"edit_trade_closed_date_{trade_id}",
+                    )
+                    closed_time = close_cols[1].time_input(
+                        "Closed time",
+                        value=closed_default.time().replace(microsecond=0),
+                        disabled=not is_closed,
+                        key=f"edit_trade_closed_time_{trade_id}",
+                    )
+
+                    price_cols = st.columns(4)
+                    edit_entry = price_cols[0].number_input(
+                        "Entry price",
+                        min_value=0.0,
+                        step=0.01,
+                        value=safe_float(trade.get("entry_price")),
+                        key=f"edit_trade_entry_{trade_id}",
+                    )
+                    edit_exit = price_cols[1].number_input(
+                        "Exit price",
+                        min_value=0.0,
+                        step=0.01,
+                        value=safe_float(trade.get("exit_price")),
+                        key=f"edit_trade_exit_{trade_id}",
+                    )
+                    edit_quantity = price_cols[2].number_input(
+                        "Contracts / shares",
+                        min_value=0.0,
+                        step=1.0,
+                        value=safe_float(trade.get("quantity")),
+                        key=f"edit_trade_quantity_{trade_id}",
+                    )
+                    edit_pl = price_cols[3].number_input(
+                        "Realized P/L",
+                        step=1.0,
+                        value=safe_float(trade.get("realized_pl")),
+                        key=f"edit_trade_pl_{trade_id}",
+                    )
+
+                    context_cols = st.columns(2)
+                    edit_confidence = context_cols[0].number_input(
+                        "Alert confidence",
+                        min_value=0,
+                        max_value=100,
+                        value=safe_int(trade.get("confidence")),
+                        key=f"edit_trade_confidence_{trade_id}",
+                    )
+                    edit_market_condition = context_cols[1].text_input(
+                        "Market condition",
+                        value=safe_text(trade.get("market_condition"), "unknown"),
+                        key=f"edit_trade_market_{trade_id}",
+                    )
+
+                    edit_emotional_state = st.text_input(
+                        "Emotional state",
+                        value=safe_text(trade.get("emotional_state")),
+                        key=f"edit_trade_emotion_{trade_id}",
+                    )
+                    edit_tags = st.multiselect(
+                        "Mistake tags",
+                        tag_options,
+                        default=saved_tags,
+                        key=f"edit_trade_tags_{trade_id}",
+                    )
+                    edit_notes = st.text_area(
+                        "Notes / lesson learned",
+                        value=safe_text(trade.get("notes")),
+                        key=f"edit_trade_notes_{trade_id}",
+                    )
+
+                    save_edit = st.form_submit_button("Save Changes")
+                    if save_edit:
+                        journal.edit_trade(
+                            trade_id=trade_id,
+                            symbol=edit_symbol,
+                            setup_type=edit_setup_type or "manual",
+                            direction=edit_direction,
+                            opened_at=to_storage_datetime(opened_date, opened_time),
+                            closed_at=to_storage_datetime(closed_date, closed_time) if is_closed else None,
+                            took_trade=took_trade,
+                            realized_pl=edit_pl,
+                            entry_price=optional_float(edit_entry),
+                            exit_price=optional_float(edit_exit),
+                            quantity=optional_float(edit_quantity),
+                            confidence=optional_confidence(edit_confidence),
+                            market_condition=edit_market_condition or "unknown",
+                            notes=edit_notes,
+                            emotional_state=edit_emotional_state,
+                            mistake_tags=edit_tags,
+                        )
+                        st.session_state["journal_flash"] = f"Trade #{trade_id} updated."
+                        st.cache_resource.clear()
+                        rerun_dashboard()
+
+                st.markdown("#### Remove Entry")
+                st.caption(
+                    "This permanently removes the trade from the journal and performance analytics."
+                )
+                with st.form(f"remove_trade_form_{trade_id}"):
+                    confirm_delete = st.checkbox(
+                        f"Yes, remove trade #{trade_id}",
+                        key=f"remove_trade_confirm_{trade_id}",
+                    )
+                    remove_submitted = st.form_submit_button("Remove Journal Entry")
+                    if remove_submitted:
+                        if not confirm_delete:
+                            st.warning("Check the confirmation box before removing this entry.")
+                        elif remove_trade_entry(store, trade_id):
+                            st.session_state["journal_flash"] = f"Trade #{trade_id} removed."
+                            st.cache_resource.clear()
+                            rerun_dashboard()
+                        else:
+                            st.warning("That trade was already removed.")
+
+with performance_tab:
     st.subheader("Performance")
     trades = store.list_trades()
     metrics = calculate_metrics(trades)
     mcols = st.columns(5)
-    mcols[0].metric("Total P/L", f"${metrics['total_pl']:.2f}")
+    mcols[0].metric("Total P/L", f"${metrics['total_pl']:,.2f}")
     mcols[1].metric("Win Rate", f"{metrics['win_rate']:.1f}%")
-    mcols[2].metric("Expectancy", f"${metrics['expectancy']:.2f}")
+    mcols[2].metric("Expectancy", f"${metrics['expectancy']:,.2f}")
     mcols[3].metric("Profit Factor", metrics["profit_factor"])
-    mcols[4].metric("Max Drawdown", f"${metrics['max_drawdown']:.2f}")
+    mcols[4].metric("Max Drawdown", f"${metrics['max_drawdown']:,.2f}")
 
     equity = pd.DataFrame(metrics["equity_curve"])
     if not equity.empty:
-        st.plotly_chart(px.line(equity, x="opened_at", y="equity", title="Equity Curve"), width="stretch")
+        equity["opened_at_dt"] = equity["opened_at"].apply(parse_datetime)
+        fig = px.line(equity, x="opened_at_dt", y="equity", title="Equity Curve")
+        fig.update_layout(
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            margin=dict(l=20, r=20, t=50, b=20),
+            xaxis_title=None,
+            yaxis_title="Equity",
+        )
+        st.plotly_chart(fig, width="stretch")
+
     periods = period_pl(trades)
     pcols = st.columns(3)
     for col, name in zip(pcols, ["daily", "weekly", "monthly"]):
@@ -264,9 +2108,9 @@ with tabs[4]:
             if values.empty:
                 st.info("No data")
             else:
-                st.dataframe(values.sort_values("period", ascending=False), hide_index=True)
+                show_table(values.sort_values("period", ascending=False), height=260)
 
-with tabs[5]:
+with breakdowns_tab:
     st.subheader("Breakdown Analytics")
     trades = store.list_trades()
     data = breakdowns(trades)
@@ -278,39 +2122,231 @@ with tabs[5]:
         if table.empty:
             st.info("No data")
         else:
-            st.dataframe(table.drop(columns=["equity_curve"], errors="ignore"), width="stretch", hide_index=True)
+            show_table(
+                table.drop(columns=["equity_curve"], errors="ignore"),
+                height=320,
+            )
 
-with tabs[6]:
-    st.subheader("Paper Trading Replay")
-    runs = df("paper_runs", 100)
-    latest_run_id = None
-    if not runs.empty:
-        latest_run_id = int(runs.sort_values("id", ascending=False).iloc[0]["id"])
-    paper_summary = store.paper_summary(latest_run_id)
-    if latest_run_id is not None:
-        st.caption(f"Showing latest replay run #{latest_run_id}. Historical runs remain below for comparison.")
-    cols = st.columns(5)
-    cols[0].metric("Replay Alerts", paper_summary["alerted_count"])
-    cols[1].metric("Avoided", paper_summary["avoided_count"])
-    cols[2].metric("Missed", paper_summary["missed_count"])
-    cols[3].metric("Win Rate", f"{paper_summary['win_rate']:.1f}%")
-    cols[4].metric("Total R", f"{paper_summary['total_r']:.2f}")
+with paper_tab:
+    st.subheader("Paper Trading: Current Strategy")
+    st.caption(
+        "This view shows one current-strategy paper W/L number. "
+        "Blocked setup types and older replay/backtest rows stay archived in SQLite but are not included here."
+    )
+    excluded_setups = set(getattr(settings, "excluded_setup_types", []) or [])
+    live_summary = live_paper.refresh_live_100_outcomes(store, excluded_setups)
+    live_events = pd.DataFrame(
+        live_paper.list_current_live_100_paper_events(store, excluded_setups)
+    )
+    live_summary = live_paper.live_100_summary(
+        live_events.to_dict("records") if not live_events.empty else []
+    )
 
-    events = df("paper_events", 500)
-    if runs.empty:
-        st.info("No replay runs yet. Run `python -m trading_bot replay --from YYYY-MM-DD --to YYYY-MM-DD`.")
+    st.markdown("### Current Strategy 100/100 Paper Trades")
+    tracking_since = "-"
+    if not live_events.empty:
+        tracking_since = format_datetime(live_events["event_time"].min(), include_relative=False)
+    live_cols = st.columns(7)
+    closed_live = live_summary.get("closed", 0)
+    live_win_rate = (
+        f"{live_summary.get('wins', 0) / closed_live * 100:.1f}%"
+        if closed_live
+        else "No Closed Trades"
+    )
+    live_cols[0].metric("100/100 Alerts", live_summary.get("alerted", 0))
+    live_cols[1].metric("Wins", live_summary.get("wins", 0))
+    live_cols[2].metric("Losses", live_summary.get("losses", 0))
+    live_cols[3].metric("Still Open", live_summary.get("open", 0))
+    live_cols[4].metric("Not Triggered", live_summary.get("not_triggered", 0))
+    live_cols[5].metric("Win Rate", live_win_rate)
+    live_cols[6].metric("Tracking Since", tracking_since)
+    st.caption(
+        "This section only tracks current-rule 100/100 live alerts. "
+        "A win means the +1R paper target hit after entry triggered. "
+        "A loss means stop hit first. Open means entry triggered but target/stop has not resolved yet. "
+        "Blocked setup types are excluded from this current-strategy score."
+    )
+    if live_events.empty:
+        st.info("No live 100/100 paper trades have been recorded yet.")
     else:
-        st.dataframe(runs, width="stretch", hide_index=True)
-    if not events.empty:
-        st.subheader("Replay Events")
-        st.dataframe(
-            events.sort_values("event_time", ascending=False),
-            width="stretch",
-            hide_index=True,
+        readable_live = live_events.copy()
+        readable_live["alert_time"] = readable_live["event_time"].apply(format_datetime)
+        readable_live["entry"] = readable_live.apply(
+            lambda row: f"{safe_float(row.get('entry_low')):.2f}-{safe_float(row.get('entry_high')):.2f}",
+            axis=1,
         )
+        readable_live["stop"] = readable_live["stop_loss"].apply(lambda value: f"{safe_float(value):.2f}")
+        readable_live["target"] = readable_live.apply(paper_target_label, axis=1)
+        readable_live["r"] = readable_live["r_multiple"].apply(lambda value: f"{safe_float(value):.2f}R")
+        readable_live["source_label"] = readable_live.apply(paper_source_label, axis=1)
+        live_columns = [
+            "alert_time",
+            "source_label",
+            "symbol",
+            "direction",
+            "setup_type",
+            "outcome",
+            "r",
+            "entry",
+            "stop",
+            "target",
+        ]
+        st.markdown("#### 100/100 Trade List")
+        for _, event in readable_live.head(12).iterrows():
+            with st.container(border=True):
+                top_cols = st.columns([1.1, 1.1, 1.1, 2.1, 1, 1])
+                top_cols[0].metric("Source", safe_text(event.get("source_label"), CORE_SOURCE_LABEL))
+                top_cols[1].metric("Ticker", safe_text(event.get("symbol")))
+                top_cols[2].metric("Direction", safe_text(event.get("direction")))
+                top_cols[3].metric("Setup", safe_text(event.get("setup_type")))
+                top_cols[4].metric("Outcome", safe_text(event.get("outcome")).upper())
+                top_cols[5].metric("R", safe_text(event.get("r"), "0.00R"))
+                detail_cols = st.columns([1.6, 1, 1, 1, 1])
+                detail_cols[0].caption(f"Alert time: {safe_text(event.get('alert_time'))}")
+                detail_cols[1].caption(f"Entry: {safe_text(event.get('entry'))}")
+                detail_cols[2].caption(f"Stop: {safe_text(event.get('stop'))}")
+                detail_cols[3].caption(f"Paper target (+1R): {safe_text(event.get('target'))}")
+                with detail_cols[4]:
+                    link_action("Open Chart", tradingview_url(safe_text(event.get("symbol"))))
+    st.markdown("### Carter Squeeze Paper Trades")
+    carter_summary = live_paper.refresh_live_carter_outcomes(store)
+    carter_events = pd.DataFrame(live_paper.list_live_carter_paper_events(store))
+    carter_summary = live_paper.live_100_summary(
+        carter_events.to_dict("records") if not carter_events.empty else []
+    )
+    carter_tracking_since = "-"
+    if not carter_events.empty:
+        carter_tracking_since = format_datetime(carter_events["event_time"].min(), include_relative=False)
+    carter_cols = st.columns(7)
+    carter_closed = carter_summary.get("closed", 0)
+    carter_win_rate = (
+        f"{carter_summary.get('wins', 0) / carter_closed * 100:.1f}%"
+        if carter_closed
+        else "No Closed Trades"
+    )
+    carter_cols[0].metric("Carter Alerts", carter_summary.get("alerted", 0))
+    carter_cols[1].metric("Wins", carter_summary.get("wins", 0))
+    carter_cols[2].metric("Losses", carter_summary.get("losses", 0))
+    carter_cols[3].metric("Still Open", carter_summary.get("open", 0))
+    carter_cols[4].metric("Not Triggered", carter_summary.get("not_triggered", 0))
+    carter_cols[5].metric("Win Rate", carter_win_rate)
+    carter_cols[6].metric("Tracking Since", carter_tracking_since)
+    if carter_events.empty:
+        st.info("No Carter Squeeze paper trades have been recorded yet.")
+    else:
+        readable_carter = carter_events.copy()
+        readable_carter["alert_time"] = readable_carter["event_time"].apply(format_datetime)
+        readable_carter["source_label"] = readable_carter.apply(paper_source_label, axis=1)
+        readable_carter["entry"] = readable_carter.apply(
+            lambda row: f"{safe_float(row.get('entry_low')):.2f}-{safe_float(row.get('entry_high')):.2f}",
+            axis=1,
+        )
+        readable_carter["stop"] = readable_carter["stop_loss"].apply(lambda value: f"{safe_float(value):.2f}")
+        readable_carter["target"] = readable_carter.apply(paper_target_label, axis=1)
+        readable_carter["r"] = readable_carter["r_multiple"].apply(lambda value: f"{safe_float(value):.2f}R")
+        show_table(
+            readable_carter[
+                [
+                    "alert_time",
+                    "source_label",
+                    "symbol",
+                    "direction",
+                    "setup_type",
+                    "outcome",
+                    "r",
+                    "entry",
+                    "stop",
+                    "target",
+                ]
+            ].head(25),
+            height=260,
+        )
+    st.markdown("### Failed Auction Trap Paper Trades")
+    st.caption(
+        "Dashboard-only experimental lane. These rows are paper-tracked for evidence; "
+        "Telegram is unchanged until the lane graduates."
+    )
+    trap_summary = live_paper.refresh_live_failed_auction_trap_outcomes(store)
+    trap_events = pd.DataFrame(live_paper.list_live_failed_auction_trap_paper_events(store))
+    trap_summary = live_paper.live_100_summary(
+        trap_events.to_dict("records") if not trap_events.empty else []
+    )
+    trap_tracking_since = "-"
+    if not trap_events.empty:
+        trap_tracking_since = format_datetime(trap_events["event_time"].min(), include_relative=False)
+    trap_cols = st.columns(7)
+    trap_closed = trap_summary.get("closed", 0)
+    trap_win_rate = (
+        f"{trap_summary.get('wins', 0) / trap_closed * 100:.1f}%"
+        if trap_closed
+        else "No Closed Trades"
+    )
+    trap_cols[0].metric("Trap Signals", trap_summary.get("alerted", 0))
+    trap_cols[1].metric("Wins", trap_summary.get("wins", 0))
+    trap_cols[2].metric("Losses", trap_summary.get("losses", 0))
+    trap_cols[3].metric("Still Open", trap_summary.get("open", 0))
+    trap_cols[4].metric("Not Triggered", trap_summary.get("not_triggered", 0))
+    trap_cols[5].metric("Win Rate", trap_win_rate)
+    trap_cols[6].metric("Tracking Since", trap_tracking_since)
+    if trap_events.empty:
+        st.info("No Failed Auction Trap paper trades have been recorded yet.")
+    else:
+        readable_trap = trap_events.copy()
+        readable_trap["alert_time"] = readable_trap["event_time"].apply(format_datetime)
+        readable_trap["source_label"] = readable_trap.apply(paper_source_label, axis=1)
+        readable_trap["entry"] = readable_trap.apply(
+            lambda row: f"{safe_float(row.get('entry_low')):.2f}-{safe_float(row.get('entry_high')):.2f}",
+            axis=1,
+        )
+        readable_trap["stop"] = readable_trap["stop_loss"].apply(lambda value: f"{safe_float(value):.2f}")
+        readable_trap["target"] = readable_trap.apply(paper_target_label, axis=1)
+        readable_trap["r"] = readable_trap["r_multiple"].apply(lambda value: f"{safe_float(value):.2f}R")
+        show_table(
+            readable_trap[
+                [
+                    "alert_time",
+                    "source_label",
+                    "symbol",
+                    "direction",
+                    "setup_type",
+                    "outcome",
+                    "r",
+                    "entry",
+                    "stop",
+                    "target",
+                ]
+            ].head(25),
+            height=260,
+        )
+    st.divider()
 
-with tabs[7]:
-    st.subheader("Reinforcement-Learning-Ready Improvement Lab")
+    with st.expander("Archived replay/backtest data", expanded=False):
+        st.caption(
+            "These are older strategy-version rows kept for audit only. "
+            "They are intentionally excluded from the current live paper stats above."
+        )
+        runs = df("paper_runs", 100)
+        events = df("paper_events", 500)
+        live_sources = {
+            LIVE_CORE_100_PAPER_SOURCE,
+            LIVE_CARTER_PAPER_SOURCE,
+            LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+        }
+        replay_runs = runs[~runs["source"].isin(live_sources)] if not runs.empty else runs
+        if replay_runs.empty:
+            st.info("No archived replay runs found.")
+        else:
+            show_table(replay_runs, height=220)
+        if not events.empty and not runs.empty:
+            replay_ids = set(replay_runs["id"].tolist()) if not replay_runs.empty else set()
+            replay_events = events[events["run_id"].isin(replay_ids)]
+            if not replay_events.empty:
+                readable_events = replay_events.copy()
+                readable_events["source_label"] = readable_events.apply(paper_source_label, axis=1)
+                show_table(readable_events.sort_values("event_time", ascending=False), height=320)
+
+with improve_tab:
+    st.subheader("Improvement Lab")
     st.caption("Recommendations are analysis only. They never change live rules unless you review and approve them.")
     engine = RecommendationEngine()
     recommendations = engine.generate(store.list_trades(), store.list_alerts())
@@ -325,7 +2361,7 @@ with tabs[7]:
                     f"Sample: {rec.sample_size} | Evidence: {rec.evidence_quality} | "
                     f"Overfitting risk: {rec.overfitting_risk}"
                 )
-        if st.button("Save Recommendations For Review"):
+        if st.button("Save Recommendations For Review", key="save_recommendations"):
             for rec in recommendations:
                 store.insert_recommendation(rec)
             st.success("Recommendations saved as pending review.")
@@ -335,4 +2371,4 @@ with tabs[7]:
     saved = df("strategy_recommendations", 100)
     if not saved.empty:
         st.subheader("Saved Recommendations")
-        st.dataframe(saved, width="stretch", hide_index=True)
+        show_table(saved, height=360)
