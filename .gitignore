@@ -10,6 +10,7 @@ data/*.db
 data/*.csv
 data/*.sqlite-journal
 data/*.pid
+data/backups/
 data/logs/
 data/yfinance_cache/
 logs/
