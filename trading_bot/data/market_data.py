@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
+import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List
 
@@ -10,7 +13,15 @@ from trading_bot.settings import PROJECT_ROOT
 logger = logging.getLogger(__name__)
 
 
-TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "60m": 60, "1h": 60}
+TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "10m": 10,
+    "15m": 15,
+    "30m": 30,
+    "60m": 60,
+    "1h": 60,
+}
 
 
 class DataUnavailable(RuntimeError):
@@ -48,6 +59,23 @@ def resample_candles(
             )
         )
     return resampled
+
+
+def completed_candles_for_timeframe(
+    candles_by_tf: Dict[str, List[Candle]], timeframe: str
+) -> List[Candle]:
+    candles = list(candles_by_tf.get(timeframe) or [])
+    minutes = TIMEFRAME_MINUTES.get(timeframe)
+    if timeframe == "1m" or not minutes:
+        return candles
+    one_minute = candles_by_tf.get("1m") or []
+    if not one_minute:
+        return candles
+    latest_raw = max(candle.timestamp for candle in one_minute)
+    completion_delta = timedelta(minutes=max(minutes - 1, 0))
+    return [
+        candle for candle in candles if candle.timestamp + completion_delta <= latest_raw
+    ]
 
 
 def latest_age_minutes(candles: List[Candle], now: datetime = None) -> float:
@@ -99,11 +127,95 @@ class MarketDataEngine:
                 threads=False,
             )
         except Exception as exc:
-            raise DataUnavailable(f"Could not fetch {symbol} {interval}: {exc}") from exc
+            logger.warning("yfinance failed for %s %s; trying Yahoo curl fallback: %s", symbol, interval, exc)
+            return self._fetch_recent_with_yahoo_chart_curl(symbol, interval, period, prepost)
 
         if frame is None or getattr(frame, "empty", True):
+            logger.warning("yfinance returned no data for %s %s; trying Yahoo curl fallback", symbol, interval)
+            return self._fetch_recent_with_yahoo_chart_curl(symbol, interval, period, prepost)
+        candles = self._normalize_frame(symbol, interval, frame)
+        if interval in {"1m", "2m", "5m", "15m", "30m", "60m", "1h"} and latest_age_minutes(candles) > 3:
+            logger.warning(
+                "yfinance returned stale %s %s data; trying Yahoo curl fallback",
+                symbol,
+                interval,
+            )
+            try:
+                fallback = self._fetch_recent_with_yahoo_chart_curl(symbol, interval, period, prepost)
+            except DataUnavailable:
+                return candles
+            if latest_age_minutes(fallback) < latest_age_minutes(candles):
+                return fallback
+        return candles
+
+    def _fetch_recent_with_yahoo_chart_curl(
+        self,
+        symbol: str,
+        interval: str,
+        period: str,
+        prepost: bool,
+    ) -> List[Candle]:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?range={period}&interval={interval}&includePrePost={str(prepost).lower()}"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "-fsSL",
+                    "--max-time",
+                    "15",
+                    "-A",
+                    "Mozilla/5.0",
+                    url,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+        except Exception as exc:
+            raise DataUnavailable(f"Could not fetch {symbol} {interval} with Yahoo fallback: {exc}") from exc
+
+        try:
+            chart_result = payload["chart"]["result"][0]
+            timestamps = chart_result.get("timestamp") or []
+            quote = chart_result["indicators"]["quote"][0]
+        except Exception as exc:
+            raise DataUnavailable(f"Yahoo fallback returned an unusable payload for {symbol} {interval}.") from exc
+
+        candles: List[Candle] = []
+        for index, raw_ts in enumerate(timestamps):
+            try:
+                open_price = float(quote["open"][index])
+                high = float(quote["high"][index])
+                low = float(quote["low"][index])
+                close = float(quote["close"][index])
+                volume = float((quote.get("volume") or [0])[index] or 0)
+            except Exception:
+                continue
+            if not all(math.isfinite(value) for value in (open_price, high, low, close)):
+                continue
+            if not math.isfinite(volume):
+                volume = 0.0
+            candles.append(
+                Candle(
+                    symbol=symbol,
+                    timeframe=interval,
+                    timestamp=datetime.fromtimestamp(int(raw_ts), tz=timezone.utc)
+                    .replace(tzinfo=None, microsecond=0),
+                    open=open_price,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=volume,
+                    source="yahoo_chart_curl",
+                )
+            )
+        if not candles:
             raise DataUnavailable(f"No data returned for {symbol} {interval}.")
-        return self._normalize_frame(symbol, interval, frame)
+        return candles
 
     def fetch_symbol_context(self, symbol: str, days: int = 5) -> Dict[str, List[Candle]]:
         period = f"{max(days, 1)}d"
@@ -111,7 +223,9 @@ class MarketDataEngine:
         context = {
             "1m": one_minute,
             "5m": resample_candles(one_minute, "5m", 5),
+            "10m": resample_candles(one_minute, "10m", 10),
             "15m": resample_candles(one_minute, "15m", 15),
+            "30m": resample_candles(one_minute, "30m", 30),
             "1h": resample_candles(one_minute, "1h", 60),
         }
         try:
@@ -144,6 +258,10 @@ class MarketDataEngine:
                 volume = float(row.get("Volume", 0) or 0)
             except Exception:
                 continue
+            if not all(math.isfinite(value) for value in (open_price, high, low, close)):
+                continue
+            if not math.isfinite(volume):
+                volume = 0.0
             candles.append(
                 Candle(
                     symbol=symbol,

@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
 
+from trading_bot.data.market_data import completed_candles_for_timeframe
 from trading_bot.levels.levels import level_map
 from trading_bot.models import Candle, Level, SetupSignal, utc_now
+
+
+DEFAULT_ALERT_TIMEFRAMES = ["5m", "15m", "30m", "1h"]
+FAST_MOMENTUM_TIMEFRAMES = [("1m", 1), ("5m", 5), ("10m", 10)]
 
 
 def average_volume(candles: List[Candle], lookback: int = 20) -> float:
@@ -28,6 +33,35 @@ def trend_bias(candles: List[Candle], lookback: int = 12) -> str:
     return "neutral"
 
 
+def fast_intraday_bias(candles_by_tf: Dict[str, List[Candle]], fallback: str) -> str:
+    one_minute = candles_by_tf.get("1m") or []
+    if len(one_minute) < 25:
+        return fallback
+    candidate_start = max(20, len(one_minute) - 5)
+    for candidate_index in range(candidate_start, len(one_minute)):
+        last = one_minute[candidate_index]
+        prior = one_minute[candidate_index - 20 : candidate_index]
+        recent = one_minute[max(0, candidate_index - 3) : candidate_index + 1]
+        if len(prior) < 20 or len(recent) < 4:
+            continue
+        avg_volume = average_volume(prior) or 1
+        avg_range = sum(c.high - c.low for c in prior) / len(prior)
+        volume_ratio = last.volume / avg_volume
+        range_ratio = candle_range(last) / max(avg_range, 0.0001)
+        recent_move_pct = (
+            (max(c.high for c in recent) - min(c.low for c in recent))
+            / max(last.close, 0.0001)
+            * 100
+        )
+        if volume_ratio < 2.4 or range_ratio < 2.0 or recent_move_pct < 0.35:
+            continue
+        if last.close > max(c.high for c in prior) and last.close > last.open:
+            return "bullish"
+        if last.close < min(c.low for c in prior) and last.close < last.open:
+            return "bearish"
+    return fallback
+
+
 def classify_strat_bar(previous: Candle, current: Candle) -> str:
     if current.high > previous.high and current.low < previous.low:
         return "3"
@@ -38,6 +72,31 @@ def classify_strat_bar(previous: Candle, current: Candle) -> str:
     if current.low < previous.low:
         return "2d"
     return "1"
+
+
+def candle_range(candle: Candle) -> float:
+    return max(candle.high - candle.low, 0.0001)
+
+
+def candle_body_ratio(candle: Candle) -> float:
+    return abs(candle.close - candle.open) / candle_range(candle)
+
+
+def close_position(candle: Candle) -> float:
+    return (candle.close - candle.low) / candle_range(candle)
+
+
+def vwap_cross_count(candles: List[Candle], vwap: float) -> int:
+    signs = []
+    for candle in candles:
+        if candle.close > vwap:
+            signs.append(1)
+        elif candle.close < vwap:
+            signs.append(-1)
+        else:
+            signs.append(0)
+    compact = [sign for sign in signs if sign != 0]
+    return sum(1 for left, right in zip(compact, compact[1:]) if left != right)
 
 
 def _risk_reward(direction: str, entry_mid: float, stop: float, target1: float) -> float:
@@ -60,24 +119,37 @@ def _build_signal(
     reasoning: str,
     avoid_if: str,
     features: Dict,
-    timeframe: str = "5m",
+    timeframe: str = "",
 ) -> SetupSignal:
+    features = dict(features)
     entry_mid = (entry_low + entry_high) / 2
     risk = abs(entry_mid - stop_loss)
-    target1_multiple = float(features.get("target1_r_multiple", 2.0))
-    target2_multiple = float(features.get("target2_r_multiple", 3.0))
+    target1_multiple = float(features.get("target1_r_multiple", 1.0))
+    target2_multiple = float(features.get("target2_r_multiple", 2.0))
     if direction == "LONG":
         target1 = entry_mid + risk * target1_multiple
         target2 = entry_mid + risk * target2_multiple
     else:
         target1 = entry_mid - risk * target1_multiple
         target2 = entry_mid - risk * target2_multiple
+    tactical_exit_multiple = features.get("tactical_exit_r_multiple")
+    if tactical_exit_multiple is not None and risk > 0:
+        tactical_multiple = float(tactical_exit_multiple)
+        tactical_exit = (
+            entry_mid + risk * tactical_multiple
+            if direction == "LONG"
+            else entry_mid - risk * tactical_multiple
+        )
+        features["tactical_exit_price"] = round(tactical_exit, 4)
+        features["tactical_exit_action"] = (
+            "SELL/PARTIAL" if direction == "LONG" else "COVER/PARTIAL"
+        )
     rr = _risk_reward(direction, entry_mid, stop_loss, target1)
     return SetupSignal(
         symbol=symbol,
         setup_type=setup_type,
         direction=direction,
-        timeframe=timeframe,
+        timeframe=timeframe or str(features.get("primary_timeframe", "15m")),
         created_at=utc_now(),
         entry_low=min(entry_low, entry_high),
         entry_high=max(entry_low, entry_high),
@@ -100,35 +172,79 @@ class StrategyEngine:
         levels: Iterable[Level],
         market_biases: Optional[Dict[str, str]] = None,
         stale_data: bool = False,
+        alert_timeframes: Optional[List[str]] = None,
+        excluded_setup_types: Optional[List[str]] = None,
     ) -> List[SetupSignal]:
-        five = candles_by_tf.get("5m") or candles_by_tf.get("1m") or []
-        fifteen = candles_by_tf.get("15m") or []
-        hourly = candles_by_tf.get("1h") or []
+        level_list = list(levels)
+        signals: List[SetupSignal] = []
+        excluded = {str(setup_type) for setup_type in excluded_setup_types or []}
+        for timeframe in alert_timeframes or DEFAULT_ALERT_TIMEFRAMES:
+            if timeframe not in DEFAULT_ALERT_TIMEFRAMES:
+                continue
+            primary = completed_candles_for_timeframe(candles_by_tf, timeframe)
+            signals.extend(
+                self._detect_for_timeframe(
+                    symbol,
+                    timeframe,
+                    primary,
+                    candles_by_tf,
+                    level_list,
+                    market_biases,
+                    stale_data,
+                )
+            )
+        if excluded:
+            signals = [
+                signal for signal in signals if signal.setup_type not in excluded
+            ]
+        signals.extend(
+            self._fast_momentum_expansion(
+                symbol,
+                candles_by_tf,
+                level_list,
+                market_biases,
+                stale_data,
+                excluded,
+            )
+        )
+        return signals
+
+    def _detect_for_timeframe(
+        self,
+        symbol: str,
+        timeframe: str,
+        primary: List[Candle],
+        candles_by_tf: Dict[str, List[Candle]],
+        levels: Iterable[Level],
+        market_biases: Optional[Dict[str, str]] = None,
+        stale_data: bool = False,
+    ) -> List[SetupSignal]:
+        fifteen = completed_candles_for_timeframe(candles_by_tf, "15m")
+        thirty = completed_candles_for_timeframe(candles_by_tf, "30m")
+        hourly = completed_candles_for_timeframe(candles_by_tf, "1h")
         daily = candles_by_tf.get("1d") or []
-        if len(five) < 3:
+        if len(primary) < 3:
             return []
 
         levels_by_name = level_map(levels)
         market_biases = market_biases or {}
         signals: List[SetupSignal] = []
-        last = five[-1]
-        previous = five[-2]
-        avg_vol = average_volume(five[:-1]) or 1
+        last = primary[-1]
+        previous = primary[-2]
+        avg_vol = average_volume(primary[:-1]) or 1
         volume_confirmed = last.volume >= avg_vol * 1.05
         weak_volume = last.volume < avg_vol * 0.65
 
-        short_bias = trend_bias(five)
-        mid_bias = trend_bias(fifteen) if fifteen else short_bias
-        hour_bias = trend_bias(hourly) if hourly else mid_bias
+        primary_bias = trend_bias(primary)
+        fifteen_bias = trend_bias(fifteen) if fifteen else primary_bias
+        thirty_bias = trend_bias(thirty) if thirty else fifteen_bias
+        hour_bias = trend_bias(hourly) if hourly else thirty_bias
         day_bias = trend_bias(daily) if daily else hour_bias
-        bullish_alignment = [short_bias, mid_bias, hour_bias].count("bullish") >= 2
-        bearish_alignment = [short_bias, mid_bias, hour_bias].count("bearish") >= 2
-        conflicting = "bullish" in {short_bias, mid_bias, hour_bias} and "bearish" in {
-            short_bias,
-            mid_bias,
-            hour_bias,
-        }
-        peer_confirmation = self._peer_confirmation(symbol, market_biases, short_bias)
+        alignment_biases = [fifteen_bias, thirty_bias, hour_bias]
+        bullish_alignment = alignment_biases.count("bullish") >= 2
+        bearish_alignment = alignment_biases.count("bearish") >= 2
+        conflicting = "bullish" in set(alignment_biases) and "bearish" in set(alignment_biases)
+        peer_confirmation = self._peer_confirmation(symbol, market_biases, primary_bias)
 
         common = {
             "volume_confirmed": volume_confirmed,
@@ -136,15 +252,28 @@ class StrategyEngine:
             "stale_data": stale_data,
             "conflicting_timeframes": conflicting,
             "market_confirmed": peer_confirmation,
+            "primary_timeframe": timeframe,
+            "signal_timestamp": last.timestamp.isoformat(),
+            "signal_source": last.source,
+            "peer_biases": dict(market_biases),
             "day_bias": day_bias,
             "hour_bias": hour_bias,
-            "fifteen_bias": mid_bias,
-            "five_bias": short_bias,
+            "thirty_bias": thirty_bias,
+            "fifteen_bias": fifteen_bias,
+            "primary_bias": primary_bias,
         }
 
         vwap = levels_by_name.get("vwap")
         if vwap:
             extension_pct = abs(last.close - vwap) / vwap * 100
+            vwap_common = {
+                "vwap_setup": True,
+                "vwap_volume_ratio": round(last.volume / avg_vol, 3) if avg_vol else 0.0,
+                "vwap_body_ratio": round(candle_body_ratio(last), 3),
+                "vwap_close_position": round(close_position(last), 3),
+                "vwap_cross_count": vwap_cross_count(primary[-8:], vwap),
+                "vwap_entry_extension_pct": round(extension_pct, 3),
+            }
             if previous.close < vwap <= last.close and last.low <= vwap * 1.002:
                 signals.append(
                     _build_signal(
@@ -162,6 +291,10 @@ class StrategyEngine:
                         avoid_if=f"{symbol} loses VWAP or rejects back below the reclaim candle.",
                         features={
                             **common,
+                            **vwap_common,
+                            "vwap_direction": "LONG",
+                            "vwap_favorable_close": close_position(last) >= 0.62,
+                            "vwap_body_confirmed": candle_body_ratio(last) >= 0.35,
                             "timeframe_aligned": bullish_alignment,
                             "level_confluence": self._near_any_level(last.close, levels_by_name),
                             "vwap_confirmed": True,
@@ -185,6 +318,10 @@ class StrategyEngine:
                         avoid_if=f"{symbol} reclaims VWAP or holds above the rejection candle.",
                         features={
                             **common,
+                            **vwap_common,
+                            "vwap_direction": "SHORT",
+                            "vwap_favorable_close": close_position(last) <= 0.38,
+                            "vwap_body_confirmed": candle_body_ratio(last) >= 0.35,
                             "timeframe_aligned": bearish_alignment,
                             "level_confluence": self._near_any_level(last.close, levels_by_name),
                             "vwap_confirmed": True,
@@ -195,13 +332,13 @@ class StrategyEngine:
                 )
 
         signals.extend(
-            self._level_breaks(symbol, five, levels_by_name, common, bullish_alignment, bearish_alignment)
+            self._level_breaks(symbol, primary, levels_by_name, common, bullish_alignment, bearish_alignment)
         )
         signals.extend(self._liquidity_sweeps(symbol, last, levels_by_name, common))
         signals.extend(
-            self._momentum_continuation(symbol, five, vwap, common, bullish_alignment, bearish_alignment)
+            self._momentum_continuation(symbol, primary, vwap, common, bullish_alignment, bearish_alignment)
         )
-        signals.extend(self._strat_continuity(symbol, five, common, bullish_alignment, bearish_alignment))
+        signals.extend(self._strat_continuity(symbol, primary, common, bullish_alignment, bearish_alignment))
         return signals
 
     @staticmethod
@@ -212,6 +349,163 @@ class StrategyEngine:
         if not peers:
             return False
         return peers.count(local_bias) >= 1
+
+    def _fast_momentum_expansion(
+        self,
+        symbol: str,
+        candles_by_tf: Dict[str, List[Candle]],
+        levels: Iterable[Level],
+        market_biases: Optional[Dict[str, str]],
+        stale_data: bool,
+        excluded_setup_types: set,
+    ) -> List[SetupSignal]:
+        if "Fast momentum expansion" in excluded_setup_types:
+            return []
+        five = completed_candles_for_timeframe(candles_by_tf, "5m")
+        fifteen = completed_candles_for_timeframe(candles_by_tf, "15m")
+        thirty = completed_candles_for_timeframe(candles_by_tf, "30m")
+        hourly = completed_candles_for_timeframe(candles_by_tf, "1h")
+
+        levels_by_name = level_map(levels)
+        local_bias = trend_bias(five or completed_candles_for_timeframe(candles_by_tf, "1m"))
+        fifteen_bias = trend_bias(fifteen) if fifteen else local_bias
+        thirty_bias = trend_bias(thirty) if thirty else fifteen_bias
+        hour_bias = trend_bias(hourly) if hourly else thirty_bias
+        peers = market_biases or {}
+        bullish_market = self._peer_confirmation(symbol, peers, "bullish")
+        bearish_market = self._peer_confirmation(symbol, peers, "bearish")
+        vwap = levels_by_name.get("vwap")
+
+        if stale_data:
+            return []
+
+        signals: List[SetupSignal] = []
+        for timeframe, minutes in FAST_MOMENTUM_TIMEFRAMES:
+            candles = completed_candles_for_timeframe(candles_by_tf, timeframe)
+            if len(candles) < 25:
+                continue
+            candidate_start = max(20, len(candles) - 5)
+            for candidate_index in range(candidate_start, len(candles)):
+                last = candles[candidate_index]
+                prior = candles[candidate_index - 20 : candidate_index]
+                recent = candles[max(0, candidate_index - 3) : candidate_index + 1]
+                if len(prior) < 20 or len(recent) < 4:
+                    continue
+                prior_high = max(c.high for c in prior)
+                prior_low = min(c.low for c in prior)
+                avg_volume = average_volume(prior) or 1
+                avg_range = sum(c.high - c.low for c in prior) / len(prior)
+                last_range = candle_range(last)
+                volume_ratio = last.volume / avg_volume
+                range_ratio = last_range / max(avg_range, 0.0001)
+                recent_low = min(c.low for c in recent)
+                recent_high = max(c.high for c in recent)
+                recent_move_pct = (recent_high - recent_low) / max(last.close, 0.0001) * 100
+                if volume_ratio < 2.4 or range_ratio < 2.0 or recent_move_pct < 0.35:
+                    continue
+                candles_through_signal = candles[: candidate_index + 1]
+                stop_window = candles_through_signal[-3:]
+                signal_lag_minutes = (len(candles) - candidate_index - 1) * minutes
+                common = {
+                    "volume_confirmed": True,
+                    "weak_volume": False,
+                    "stale_data": stale_data,
+                    "conflicting_timeframes": False,
+                    "primary_timeframe": timeframe,
+                    "signal_timestamp": last.timestamp.isoformat(),
+                    "signal_source": last.source,
+                    "signal_lag_minutes": signal_lag_minutes,
+                    "day_bias": hour_bias,
+                    "hour_bias": hour_bias,
+                    "thirty_bias": thirty_bias,
+                    "fifteen_bias": fifteen_bias,
+                    "primary_bias": trend_bias(candles),
+                    "peer_biases": dict(peers),
+                    "fast_momentum_expansion": True,
+                    "midday_momentum_exception": True,
+                    "volume_expansion_ratio": round(volume_ratio, 2),
+                    "range_expansion_ratio": round(range_ratio, 2),
+                    "recent_move_pct": round(recent_move_pct, 3),
+                    "target1_r_multiple": 1.0,
+                    "target2_r_multiple": 2.0,
+                    "tactical_management": True,
+                    "tactical_exit_r_multiple": 1.0,
+                }
+                if (
+                    last.close > prior_high
+                    and close_position(last) >= 0.60
+                    and (vwap is None or last.close > vwap)
+                    and bullish_market
+                ):
+                    stop = min(last.low, min(c.low for c in stop_window))
+                    signals.append(
+                        _build_signal(
+                            symbol,
+                            "Fast momentum expansion",
+                            "LONG",
+                            last,
+                            entry_low=last.close - last_range * 0.35,
+                            entry_high=last.close,
+                            stop_loss=stop,
+                            invalidation=stop,
+                            reasoning=(
+                                f"{symbol} broke the recent {timeframe} intraday range on unusual volume "
+                                "with SPY/QQQ/IWM confirmation."
+                            ),
+                            avoid_if=(
+                                f"{symbol} falls back inside the prior range or the momentum candle low fails."
+                            ),
+                            features={
+                                **common,
+                                "market_confirmed": True,
+                                "timeframe_aligned": True,
+                                "level_confluence": True,
+                                "vwap_confirmed": vwap is None or last.close > vwap,
+                                "overextended": False,
+                                "breakout_level": round(prior_high, 4),
+                            },
+                            timeframe=timeframe,
+                        )
+                    )
+                    break
+                if (
+                    last.close < prior_low
+                    and close_position(last) <= 0.40
+                    and (vwap is None or last.close < vwap)
+                    and bearish_market
+                ):
+                    stop = max(last.high, max(c.high for c in stop_window))
+                    signals.append(
+                        _build_signal(
+                            symbol,
+                            "Fast momentum expansion",
+                            "SHORT",
+                            last,
+                            entry_low=last.close,
+                            entry_high=last.close + last_range * 0.35,
+                            stop_loss=stop,
+                            invalidation=stop,
+                            reasoning=(
+                                f"{symbol} broke the recent {timeframe} intraday range lower on unusual volume "
+                                "with SPY/QQQ/IWM confirmation."
+                            ),
+                            avoid_if=(
+                                f"{symbol} reclaims the prior range or the momentum candle high fails."
+                            ),
+                            features={
+                                **common,
+                                "market_confirmed": True,
+                                "timeframe_aligned": True,
+                                "level_confluence": True,
+                                "vwap_confirmed": vwap is None or last.close < vwap,
+                                "overextended": False,
+                                "breakdown_level": round(prior_low, 4),
+                            },
+                            timeframe=timeframe,
+                        )
+                    )
+                    break
+        return signals
 
     @staticmethod
     def _near_any_level(price: float, levels_by_name: Dict[str, float], pct: float = 0.18) -> bool:
@@ -312,6 +606,8 @@ class StrategyEngine:
                         "level_confluence": True,
                         "vwap_confirmed": last.close > levels_by_name.get("vwap", 0),
                         "overextended": False,
+                        "tactical_management": True,
+                        "tactical_exit_r_multiple": 1.0,
                     },
                 )
             )
@@ -334,6 +630,8 @@ class StrategyEngine:
                         "level_confluence": True,
                         "vwap_confirmed": last.close < levels_by_name.get("vwap", float("inf")),
                         "overextended": False,
+                        "tactical_management": True,
+                        "tactical_exit_r_multiple": 1.0,
                     },
                 )
             )

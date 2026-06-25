@@ -22,7 +22,7 @@ Validate these gates:
 - Confirm the repository is current.
 - Confirm `.env` is ignored and no secrets are committed.
 - Confirm dependencies install in a local virtual environment.
-- Confirm `config/settings.yaml` uses SPY, QQQ, IWM only and an alert threshold of 85.
+- Confirm `config/settings.yaml` uses SPY, QQQ, IWM only and an alert threshold of 80.
 
 2. Automated tests
 - Run `.venv/bin/python -m pytest`.
@@ -42,9 +42,10 @@ Validate these gates:
 - Confirm no automated trade execution exists.
 
 5. Alert behavior
-- Confirm sub-85 setups do not send Telegram alerts.
-- Confirm 85+ setups are the only setups eligible for Telegram alerts.
+- Confirm sub-80 setups do not send Telegram alerts.
+- Confirm 80+ setups are the only setups eligible for Telegram alerts.
 - Confirm duplicate alerts are suppressed.
+- Confirm suggested sell/partial alerts are alert-only management guidance, do not place orders, and do not count against entry-alert caps.
 - Confirm every alert includes ticker, setup type, direction, entry zone, stop, targets, invalidation, confidence, risk/reward, plain-English reasoning, avoid-if warning, and alert-only footer.
 - If Telegram credentials are configured, run `.venv/bin/python -m trading_bot telegram_test` and verify delivery.
 
@@ -61,6 +62,8 @@ Validate these gates:
 - Run a replay using stored candles or CSV data.
 - Run `.venv/bin/python -m trading_bot paper_summary`.
 - Confirm paper events are stored.
+- Confirm replay evaluates only on completed alert timeframe closes and does not use partial 15m/30m/1h bars for setup detection.
+- Confirm replay does not use full future daily candles for current-day intraday decisions.
 - Confirm recommendations are pending review only and do not mutate live scoring rules automatically.
 
 9. Local deployment
@@ -93,12 +96,14 @@ Do not call the system ready for real-money decisions unless the phased framewor
 The software MVP is done only when:
 
 - Continuous scanning works for SPY, QQQ, and IWM.
-- Only 85-100 confidence setups are eligible for Telegram alerts.
+- Only 80-100 confidence setups are eligible for Telegram alerts.
 - Telegram delivery is verified when credentials are configured.
 - Low-quality conditions produce NO TRADE instead of forced alerts.
+- SPY VWAP reclaim long alerts remain blocked pending review unless explicitly approved later.
+- Liquidity sweep alerts include +1R tactical management guidance and suggested sell/partial alerts remain alert-only.
 - Trade journaling and manual realized P/L tracking work.
 - Performance analytics and equity curve work.
-- Replay and recommendations work without automatically changing live rules.
+- Replay evaluates on completed candle closes, avoids current-day daily lookahead, and recommendations work without automatically changing live rules.
 - Streamlit dashboard renders without app errors.
 - Local deployment or local run commands are documented and verified.
 - README setup, strategy, testing, and deployment instructions are accurate.

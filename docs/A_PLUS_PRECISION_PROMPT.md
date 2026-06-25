@@ -13,7 +13,7 @@ Primary objective:
 Required constraints:
 - The bot remains alert-only and never places trades.
 - Only SPY, QQQ, and IWM are allowed.
-- Telegram alerts must still be a subset of 85-100 confidence setups.
+- Telegram alerts must still be a subset of 80-100 confidence setups.
 - Strategy changes are recommendations until manually reviewed and approved.
 - Free data quality limitations must be called out.
 

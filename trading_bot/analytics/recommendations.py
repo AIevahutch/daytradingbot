@@ -126,7 +126,7 @@ class RecommendationEngine:
         simulated_taken = [
             row
             for row in affected
-            if row.get("confidence") is not None and int(row["confidence"]) + score_delta >= 85
+            if row.get("confidence") is not None and int(row["confidence"]) + score_delta >= 80
         ]
         simulated = calculate_metrics(simulated_taken)
         return {
