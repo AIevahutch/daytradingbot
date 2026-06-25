@@ -40,8 +40,11 @@ from trading_bot.signal_sources import (
     CORE_SOURCE_LABEL,
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
+    FAST_MOMENTUM_SIGNAL_SOURCE,
+    FAST_MOMENTUM_SOURCE_LABEL,
     LIVE_CARTER_PAPER_SOURCE,
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+    LIVE_FAST_MOMENTUM_PAPER_SOURCE,
     tag_alert_source,
 )
 from trading_bot.storage import SQLiteStore
@@ -200,8 +203,17 @@ class TradingScanner:
                 setup_id = self.store.insert_setup(scored)
                 scored_records.append((scored, setup_id))
 
+            dashboard_only_setup_ids = set()
+            for scored, setup_id in scored_records:
+                if _is_fast_momentum_experiment(scored) and self.scorer.is_alertable(scored):
+                    self._record_fast_momentum_signal(result, scored, setup_id)
+                    dashboard_only_setup_ids.add(setup_id)
+
             alertable_records = [
-                record for record in ranked_records(scored_records) if self.scorer.is_alertable(record[0])
+                record
+                for record in ranked_records(scored_records)
+                if record[1] not in dashboard_only_setup_ids
+                and self.scorer.is_alertable(record[0])
             ]
             chosen_record = alertable_records[0] if alertable_records else None
 
@@ -447,6 +459,38 @@ class TradingScanner:
             f"{setup.confidence}/100 paper-tracked dashboard-only"
         )
 
+    def _record_fast_momentum_signal(
+        self,
+        result: Dict[str, List[str]],
+        setup: SetupSignal,
+        setup_id: int,
+    ) -> None:
+        session_date = current_session_date(self.settings).isoformat()
+        run_id = self.store.get_or_create_paper_run(
+            LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+            session_date,
+            [setup.symbol],
+        )
+        event_id = self.store.insert_source_paper_signal(
+            run_id=run_id,
+            setup_id=setup_id,
+            setup=setup,
+            mode=LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+            source_key=FAST_MOMENTUM_SIGNAL_SOURCE,
+            source_label=FAST_MOMENTUM_SOURCE_LABEL,
+            notes=(
+                "Dashboard-only paper trade from Fast Momentum Expansion experiment. "
+                "No Telegram alert sent; no real order placed."
+            ),
+        )
+        if event_id is None:
+            result["no_trade"].append(f"Fast Momentum {setup.symbol}: duplicate paper signal suppressed")
+            return
+        result["watch_only"].append(
+            f"Fast Momentum {setup.symbol}: {setup.timeframe} {setup.direction} "
+            f"{setup.confidence}/100 paper-tracked dashboard-only"
+        )
+
     def _send_tactical_exit_alerts(self, contexts: Dict[str, Dict[str, List[Candle]]]) -> List[str]:
         sent = []
         since = datetime.utcnow().replace(microsecond=0) - timedelta(days=1)
@@ -567,6 +611,13 @@ def _exclude_setup_types(
     if not excluded:
         return setups
     return [setup for setup in setups if setup.setup_type not in excluded]
+
+
+def _is_fast_momentum_experiment(setup: SetupSignal) -> bool:
+    return (
+        setup.setup_type == "Fast momentum expansion"
+        or bool((setup.features or {}).get("fast_momentum_expansion"))
+    )
 
 
 def _tactical_exit_followup_allowed(setup: SetupSignal, settings: Settings) -> bool:
