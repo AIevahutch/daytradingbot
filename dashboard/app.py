@@ -1167,6 +1167,79 @@ def paper_summary_row(label: str, summary: dict) -> dict:
     }
 
 
+def format_profit_factor(value) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if numeric == float("inf"):
+        return "Inf"
+    return f"{numeric:.2f}"
+
+
+def experimental_lane_summary_rows(summaries: list[dict]) -> pd.DataFrame:
+    rows = []
+    for summary in summaries:
+        gates = summary.get("graduation_gates") or {}
+        passed = sum(1 for value in gates.values() if value)
+        total = len(gates) or 5
+        closed = int(summary.get("closed_signals") or 0)
+        rows.append(
+            {
+                "Lane": summary.get("source_label"),
+                "Status": summary.get("graduation_status"),
+                "Open": int(summary.get("open_signals") or 0),
+                "Closed": closed,
+                "Wins": int(summary.get("wins") or 0),
+                "Losses": int(summary.get("losses") or 0),
+                "Win Rate": f"{summary.get('win_rate', 0):.1f}%" if closed else "No Closed",
+                "Profit Factor": format_profit_factor(summary.get("profit_factor")),
+                "Expectancy": f"{summary.get('expectancy_r', 0):.2f}R",
+                "Trading Days": int(summary.get("trading_days") or 0),
+                "Graduation Progress": f"{passed}/{total} gates",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def experimental_lane_events_table(events: list[dict], *, closed: bool) -> pd.DataFrame:
+    if not events:
+        return pd.DataFrame()
+    table = pd.DataFrame(events)
+    if table.empty:
+        return pd.DataFrame()
+    if closed:
+        table = table[table["outcome"].isin(["win", "loss", "breakeven", "not_triggered"])]
+    else:
+        table = table[table["outcome"] == "open"]
+    if table.empty:
+        return pd.DataFrame()
+    table["alert_time"] = table["event_time"].apply(format_datetime)
+    table["source_label"] = table.apply(paper_source_label, axis=1)
+    table["entry"] = table.apply(
+        lambda row: f"{safe_float(row.get('entry_low')):.2f}-{safe_float(row.get('entry_high')):.2f}",
+        axis=1,
+    )
+    table["stop"] = table["stop_loss"].apply(lambda value: f"{safe_float(value):.2f}")
+    table["target"] = table.apply(paper_target_label, axis=1)
+    table["r"] = table["r_multiple"].apply(lambda value: f"{safe_float(value):.2f}R")
+    return table[
+        [
+            "alert_time",
+            "source_label",
+            "symbol",
+            "direction",
+            "setup_type",
+            "outcome",
+            "confidence",
+            "r",
+            "entry",
+            "stop",
+            "target",
+        ]
+    ].head(50)
+
+
 def latest_research_by_phase(session_date: Optional[str] = None) -> dict:
     briefs = rows("research_briefs", 50)
     if session_date:
@@ -2363,6 +2436,49 @@ with paper_tab:
         disabled=True,
         key="experiment_promotion_rules",
     )
+
+    st.markdown("#### Experimental Lane Paper Evidence")
+    st.caption(
+        "These are dashboard-only lanes collecting paper evidence. "
+        "They stay out of Telegram and out of the core score until they pass every gate and Eva approves promotion."
+    )
+    experimental_summaries = live_paper.experimental_lane_summaries(store)
+    experimental_summary_table = experimental_lane_summary_rows(experimental_summaries)
+    if experimental_summary_table.empty:
+        st.info("No experimental lane paper evidence has been recorded yet.")
+    else:
+        show_table(experimental_summary_table, height=220)
+
+    experimental_events = []
+    for summary in experimental_summaries:
+        experimental_events.extend(
+            live_paper.list_live_experimental_lane_paper_events(
+                store,
+                summary["paper_source"],
+            )
+        )
+
+    open_experiment_events = experimental_lane_events_table(
+        experimental_events,
+        closed=False,
+    )
+    closed_experiment_events = experimental_lane_events_table(
+        experimental_events,
+        closed=True,
+    )
+    lane_cols = st.columns(2)
+    with lane_cols[0]:
+        st.markdown("##### Open Experimental Signals")
+        if open_experiment_events.empty:
+            st.info("No open experimental signals right now.")
+        else:
+            show_table(open_experiment_events, height=300)
+    with lane_cols[1]:
+        st.markdown("##### Closed Experimental Results")
+        if closed_experiment_events.empty:
+            st.info("No closed experimental results yet.")
+        else:
+            show_table(closed_experiment_events, height=300)
 
     st.markdown("#### Current Non-Alert Candidates")
     experiment_setups = experiment_candidate_rows(df("setups", 300))
