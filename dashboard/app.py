@@ -67,13 +67,13 @@ AUTO_REFRESH_SECONDS = 60
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
-2. Minimum 20 closed paper-tracked signals before promotion review.
+2. Minimum 25 closed paper-tracked signals before promotion review.
 3. Win rate must be 80% or better on closed paper signals.
 4. Profit factor must be 2.0 or better.
 5. Expectancy must be +0.40R per trade or better using the bot's 1R paper target logic.
-6. Losses must have a clear, filterable reason. No promotion if wins depend on one lucky outlier.
-7. SPY and QQQ should agree in direction for high-conviction index alerts.
-8. Risk warning must stay visible when fast expansion or early-entry behavior increases risk.
+6. Evidence must span at least 3 trading days.
+7. Drawdown must be controlled, and losses must have a clear, filterable reason.
+8. SPY and QQQ should agree in direction for high-conviction index alerts.
 9. Eva must approve the lane before it becomes Telegram-alertable.
 10. Alert-only forever. This bot never auto-trades."""
 
