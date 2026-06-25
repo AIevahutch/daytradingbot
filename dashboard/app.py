@@ -64,6 +64,18 @@ st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 
 AUTO_REFRESH_SECONDS = 60
+EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
+
+1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
+2. Minimum 20 closed paper-tracked signals before promotion review.
+3. Win rate must be 80% or better on closed paper signals.
+4. Profit factor must be 2.0 or better.
+5. Expectancy must be +0.40R per trade or better using the bot's 1R paper target logic.
+6. Losses must have a clear, filterable reason. No promotion if wins depend on one lucky outlier.
+7. SPY and QQQ should agree in direction for high-conviction index alerts.
+8. Risk warning must stay visible when fast expansion or early-entry behavior increases risk.
+9. Eva must approve the lane before it becomes Telegram-alertable.
+10. Alert-only forever. This bot never auto-trades."""
 
 
 def enable_auto_refresh(interval_seconds: int = AUTO_REFRESH_SECONDS) -> None:
@@ -1121,6 +1133,56 @@ def paper_target_label(row) -> str:
     if paper_target not in (None, ""):
         return f"{safe_float(paper_target):.2f}"
     return f"{safe_float(row.get('target1')):.2f}"
+
+
+def experiment_candidate_rows(setups: pd.DataFrame, *, limit: int = 25) -> pd.DataFrame:
+    if setups.empty:
+        return pd.DataFrame()
+    candidates = setups.copy()
+    candidates["_status"] = candidates["status"].astype(str).str.lower()
+    candidates = candidates[candidates["_status"].isin({"watch_only", "candidate"})]
+    if candidates.empty:
+        return pd.DataFrame()
+    candidates["source_label"] = candidates.apply(setup_source_label, axis=1)
+    candidates["created"] = candidates["created_at"].apply(format_datetime)
+    candidates["entry"] = candidates.apply(
+        lambda row: f"{safe_float(row.get('entry_low')):.2f}-{safe_float(row.get('entry_high')):.2f}",
+        axis=1,
+    )
+    candidates["stop"] = candidates["stop_loss"].apply(lambda value: f"{safe_float(value):.2f}")
+    candidates["target"] = candidates["target1"].apply(lambda value: f"{safe_float(value):.2f}")
+    candidates["_confidence_sort"] = pd.to_numeric(candidates["confidence"], errors="coerce").fillna(0)
+    candidates = candidates.sort_values(
+        ["created_at", "_confidence_sort"],
+        ascending=[False, False],
+    )
+    return candidates[
+        [
+            "created",
+            "source_label",
+            "symbol",
+            "direction",
+            "setup_type",
+            "timeframe",
+            "confidence",
+            "status",
+            "entry",
+            "stop",
+            "target",
+            "market_condition",
+        ]
+    ].head(limit)
+
+
+def latest_watch_only_notes(heartbeats: pd.DataFrame) -> list:
+    if heartbeats.empty:
+        return []
+    latest = heartbeats.sort_values("completed_at", ascending=False).iloc[0]
+    try:
+        summary = json.loads(latest.get("summary_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in summary.get("watch_only") or []]
 
 
 def paper_summary_row(label: str, summary: dict) -> dict:
@@ -2322,6 +2384,33 @@ with paper_tab:
             ].head(25),
             height=260,
         )
+
+    st.markdown("### Experiment Bench")
+    st.caption(
+        "Setups here are not promoted alert lanes. They are monitored separately so they can earn evidence without changing the core score."
+    )
+    st.text_area(
+        "Promotion rules to become an alert lane",
+        value=EXPERIMENT_PROMOTION_RULES,
+        height=265,
+        disabled=True,
+        key="experiment_promotion_rules",
+    )
+
+    st.markdown("#### Current Non-Alert Candidates")
+    experiment_setups = experiment_candidate_rows(df("setups", 300))
+    if experiment_setups.empty:
+        st.info("No watch-only or candidate experiment setups are active in the latest stored setup window.")
+    else:
+        show_table(experiment_setups, height=320)
+
+    with st.expander("Latest Scanner Watch-Only Notes", expanded=False):
+        watch_notes = latest_watch_only_notes(df("scanner_heartbeats", 5))
+        if not watch_notes:
+            st.info("No watch-only notes in the latest scanner heartbeat.")
+        else:
+            for note in watch_notes:
+                st.write(note)
     st.divider()
 
     with st.expander("Archived replay/backtest data", expanded=False):
