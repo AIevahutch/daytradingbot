@@ -29,6 +29,8 @@ from trading_bot.signal_sources import (
     CORE_SOURCE_LABEL,
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
+    FAST_MOMENTUM_SIGNAL_SOURCE,
+    LIVE_FAST_MOMENTUM_PAPER_SOURCE,
     LIVE_CARTER_PAPER_SOURCE,
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
     tag_alert_source,
@@ -162,6 +164,53 @@ class EmptyStrategy:
         return []
 
 
+class FakeFastMomentumStrategy:
+    def detect(
+        self,
+        symbol,
+        candles_by_tf,
+        levels,
+        market_biases,
+        stale_data=False,
+        alert_timeframes=None,
+    ):
+        return [
+            SetupSignal(
+                symbol=symbol,
+                setup_type="Fast momentum expansion",
+                direction="SHORT",
+                timeframe="5m",
+                created_at=utc_now(),
+                entry_low=100.0,
+                entry_high=100.2,
+                stop_loss=101.0,
+                target1=99.0,
+                target2=98.0,
+                invalidation=101.0,
+                risk_reward=1.0,
+                reasoning="Synthetic fast momentum expansion.",
+                avoid_if="Momentum candle is reclaimed.",
+                features={
+                    "fast_momentum_expansion": True,
+                    "midday_momentum_exception": True,
+                    "volume_expansion_ratio": 3.0,
+                    "range_expansion_ratio": 2.5,
+                    "recent_move_pct": 0.5,
+                    "timeframe_aligned": True,
+                    "level_confluence": True,
+                    "vwap_confirmed": True,
+                    "volume_confirmed": True,
+                    "market_confirmed": True,
+                    "peer_biases": {
+                        "SPY": "bearish",
+                        "QQQ": "bearish",
+                        "IWM": "bearish",
+                    },
+                },
+            )
+        ]
+
+
 class FakeCarterSqueeze:
     def detect(self, symbol, context, market_biases, no_trade_state=None):
         setup = SetupSignal(
@@ -239,6 +288,11 @@ class FakeFailedAuctionTrap:
 
     def is_paper_trackable(self, setup):
         return setup.status == "alert_ready" and setup.confidence >= 80
+
+
+class EmptyFailedAuctionTrap:
+    def detect(self, symbol, context, levels=None, market_biases=None, no_trade_state=None):
+        return []
 
 
 class FakeNoTrade:
@@ -438,6 +492,45 @@ def test_scanner_paper_tracks_failed_auction_trap_without_telegram(tmp_path):
     assert metadata["telegram_sent"] is False
     assert metadata["signal_source"] == FAILED_AUCTION_TRAP_SIGNAL_SOURCE
     assert metadata["source_label"] == FAILED_AUCTION_TRAP_SOURCE_LABEL
+
+
+def test_scanner_paper_tracks_fast_momentum_without_telegram(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "fast_momentum.sqlite"),
+        telegram_retry_delay_seconds=0,
+        max_alerts_per_symbol_per_day=3,
+    )
+    settings.research["enabled"] = False
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeFastMomentumStrategy()
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert telegram.messages == []
+    assert outcome["alerts"] == []
+    assert any("Fast Momentum SPY" in item for item in outcome["watch_only"])
+    alerts = store.list_rows("alerts", 10)
+    assert alerts == []
+    paper_runs = store.list_rows("paper_runs", 10)
+    assert len(paper_runs) == 1
+    assert paper_runs[0]["source"] == LIVE_FAST_MOMENTUM_PAPER_SOURCE
+    paper_events = store.list_rows("paper_events", 10)
+    assert len(paper_events) == 1
+    metadata = json.loads(paper_events[0]["metadata_json"])
+    assert metadata["paper_only"] is True
+    assert metadata["telegram_sent"] is False
+    assert metadata["signal_source"] == FAST_MOMENTUM_SIGNAL_SOURCE
 
 
 def test_live_100_paper_outcomes_update_from_candles(tmp_path):
