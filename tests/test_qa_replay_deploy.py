@@ -303,6 +303,31 @@ class FakeCoreLiquiditySweep100Strategy:
         ]
 
 
+class FixedConfidenceScorer:
+    def __init__(self, confidence: int):
+        self.confidence = confidence
+
+    def score(self, setup, no_trade_state):
+        setup.confidence = self.confidence
+        setup.status = "alert_ready"
+        setup.features = {
+            **(setup.features or {}),
+            "score_breakdown": {
+                "threshold": 80,
+                "positives": [],
+                "penalties": [],
+                "hard_blocks": [],
+                "raw_score": self.confidence,
+                "final_score": self.confidence,
+                "status": "alert_ready",
+            },
+        }
+        return setup
+
+    def is_alertable(self, setup):
+        return setup.status == "alert_ready" and setup.confidence >= 80
+
+
 class FakeCarterSqueeze:
     def detect(self, symbol, context, market_biases, no_trade_state=None):
         setup = SetupSignal(
@@ -797,6 +822,37 @@ def test_scanner_allows_100_liquidity_sweep_after_daily_cap(tmp_path):
     assert not any("daily alert cap reached" in item for item in outcome["no_trade"])
     assert len(telegram.messages) == 1
     assert "Liquidity sweep reversal" in telegram.messages[0]
+
+
+def test_core_80_to_94_setups_are_dashboard_only(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "core_dashboard_only.sqlite"),
+        telegram_retry_delay_seconds=0,
+    )
+    settings.research["enabled"] = False
+    settings.strategy["duplicate_alert_minutes"] = 0
+    settings.strategy["symbol_alert_cooldown_minutes"] = 0
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.scorer = FixedConfidenceScorer(94)
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert outcome["alerts"] == []
+    assert telegram.messages == []
+    assert any("94/100 dashboard-only" in item for item in outcome["watch_only"])
+    assert store.list_rows("alerts", 10) == []
 
 
 def test_experimental_lane_metrics_separate_open_and_closed_signals(tmp_path):
