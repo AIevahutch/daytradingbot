@@ -54,6 +54,7 @@ from trading_bot.storage import SQLiteStore
 from trading_bot.strategy.engine import StrategyEngine, fast_intraday_bias, trend_bias
 
 logger = logging.getLogger(__name__)
+CORE_TELEGRAM_MIN_CONFIDENCE = 95
 
 
 def _parse_session_time(value: str) -> dt_time:
@@ -215,21 +216,34 @@ class TradingScanner:
                     self._record_high_potential_liquidity_sweep(result, scored, setup_id)
                     dashboard_only_setup_ids.add(setup_id)
 
-            alertable_records = [
+            dashboard_candidate_records = [
                 record
                 for record in ranked_records(scored_records)
                 if record[1] not in dashboard_only_setup_ids
                 and self.scorer.is_alertable(record[0])
+            ]
+            alertable_records = [
+                record
+                for record in dashboard_candidate_records
+                if _core_telegram_alert_allowed(record[0])
             ]
             chosen_record = alertable_records[0] if alertable_records else None
 
             for scored, setup_id in scored_records:
                 if chosen_record and setup_id == chosen_record[1]:
                     continue
+                if setup_id in dashboard_only_setup_ids:
+                    continue
                 if self.scorer.is_alertable(scored):
-                    result["no_trade"].append(
-                        f"{symbol}: lower-priority {scored.setup_type} suppressed"
-                    )
+                    if _core_telegram_alert_allowed(scored):
+                        result["no_trade"].append(
+                            f"{symbol}: lower-priority {scored.setup_type} suppressed"
+                        )
+                    else:
+                        result["watch_only"].append(
+                            f"Core Model {symbol}: {scored.timeframe} {scored.setup_type} "
+                            f"{scored.confidence}/100 dashboard-only"
+                        )
                 else:
                     result["watch_only"].append(
                         f"{symbol}: {scored.timeframe} {scored.setup_type} {scored.confidence}/100"
@@ -715,6 +729,13 @@ def _daily_cap_override_allowed(setup: SetupSignal) -> bool:
         setup.setup_type == "Liquidity sweep reversal"
         and int(setup.confidence or 0) >= 100
         and setup.status == "alert_ready"
+    )
+
+
+def _core_telegram_alert_allowed(setup: SetupSignal) -> bool:
+    return (
+        setup.status == "alert_ready"
+        and int(setup.confidence or 0) >= CORE_TELEGRAM_MIN_CONFIDENCE
     )
 
 

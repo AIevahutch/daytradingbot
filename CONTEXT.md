@@ -69,7 +69,7 @@ A bearish directional alert or watch-only signal. It does not recommend a specif
 _Avoid_: Put contract, buy put alert
 
 **Telegram Alert Stream**:
-The smallest user-facing notification stream, reserved for current core tradable alerts and Carter Squeeze Put Alerts. Experimental setup lanes remain dashboard-only until they graduate.
+The smallest user-facing notification stream, reserved for the highest-confidence current core tradable alerts and Carter Squeeze Put Alerts. Core setups scoring 80-94 remain dashboard-only candidates even when they are technically alert-ready; they do not send Telegram. Experimental setup lanes remain dashboard-only until they graduate.
 _Avoid_: All alerts, watchlist feed
 
 **Telegram Management Alert**:
