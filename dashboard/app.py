@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from trading_bot.analytics.performance import breakdowns, calculate_metrics, period_pl
 from trading_bot.analytics.recommendations import RecommendationEngine
 from trading_bot.alerts.telegram import TelegramClient
+from trading_bot.dashboard_refresh import enable_dashboard_auto_refresh
 from trading_bot.email.gmail import GmailSMTPClient
 from trading_bot.health import run_healthcheck
 from trading_bot.journal.delete import remove_trade_entry
@@ -79,37 +79,7 @@ EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 
 def enable_auto_refresh(interval_seconds: int = AUTO_REFRESH_SECONDS) -> None:
-    interval_ms = max(int(interval_seconds * 1000), 10000)
-    components.html(
-        f"""
-        <script>
-        const refreshIntervalMs = {interval_ms};
-        function userIsEditing() {{
-          try {{
-            const active = window.parent.document.activeElement;
-            if (!active) return false;
-            const tag = (active.tagName || "").toLowerCase();
-            return tag === "input" || tag === "textarea" || active.isContentEditable;
-          }} catch (error) {{
-            return false;
-          }}
-        }}
-        function scheduleDashboardRefresh() {{
-          window.setTimeout(() => {{
-            if (userIsEditing()) {{
-              scheduleDashboardRefresh();
-              return;
-            }}
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set("auto_refresh", Date.now().toString());
-            window.parent.location.replace(url.toString());
-          }}, refreshIntervalMs);
-        }}
-        scheduleDashboardRefresh();
-        </script>
-        """,
-        height=1,
-    )
+    enable_dashboard_auto_refresh(interval_seconds)
 
 
 enable_auto_refresh()
