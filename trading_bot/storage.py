@@ -798,6 +798,20 @@ class SQLiteStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def has_tactical_exit_alert_for_setup(self, setup_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select id from alerts
+                where setup_id = ?
+                  and setup_type = 'Suggested sell/partial'
+                  and delivered = 1
+                limit 1
+                """,
+                (setup_id,),
+            ).fetchone()
+        return row is not None
+
     def update_alert_delivery(
         self, alert_id: int, delivered: bool, delivery_error: Optional[str] = None
     ) -> None:

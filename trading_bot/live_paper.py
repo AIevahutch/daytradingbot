@@ -97,6 +97,16 @@ def refresh_live_source_outcomes(
             managed_setup,
             future,
         )
+        if _has_existing_management_win(store, event, metadata):
+            outcome = "win"
+            r_multiple = 1.0
+            path_metrics = {
+                **path_metrics,
+                "resolution": "telegram_management_alert",
+                "management_alert_override": True,
+                "tactical_outcome": "win",
+                "tactical_r_multiple": 1.0,
+            }
         merged_metadata = {
             **metadata,
             **management_metadata,
@@ -347,6 +357,27 @@ def _experimental_lane_summary(config: Dict, events: List[Dict]) -> Dict:
         else "Collecting evidence",
         "graduation_gates": gates,
     }
+
+
+def _has_existing_management_win(
+    store: SQLiteStore,
+    event: Dict,
+    metadata: Dict,
+) -> bool:
+    if not hasattr(store, "has_tactical_exit_alert_for_setup"):
+        return False
+    setup_ids = [
+        metadata.get("original_core_setup_id"),
+        metadata.get("setup_id"),
+    ]
+    for raw_setup_id in setup_ids:
+        try:
+            setup_id = int(raw_setup_id)
+        except (TypeError, ValueError):
+            continue
+        if store.has_tactical_exit_alert_for_setup(setup_id):
+            return True
+    return False
 
 
 def _metadata(event: Dict) -> Dict:

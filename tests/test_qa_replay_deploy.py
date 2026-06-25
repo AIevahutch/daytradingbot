@@ -14,6 +14,7 @@ from trading_bot.live_paper import (
     list_live_carter_put_paper_events,
     list_current_live_100_paper_events,
     refresh_live_100_outcomes,
+    refresh_live_source_outcomes,
 )
 from trading_bot.models import Candle, SetupSignal, utc_now
 from trading_bot.research.agent import current_session_date
@@ -788,6 +789,94 @@ def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     assert metadata["paper_target1"] == 102.0
     assert metadata["original_target1"] == 103.5
     assert metadata["path_metrics"]["resolution"] == "target1"
+
+
+def test_live_paper_honors_existing_tactical_exit_alert(tmp_path):
+    settings = Settings(symbols=["IWM"], database_path=str(tmp_path / "managed_win.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    run_id = store.get_or_create_paper_run(
+        LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        "2026-06-25",
+        ["IWM"],
+    )
+    alert_time = datetime(2026, 6, 25, 6, 53, 20)
+    setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="15m",
+        created_at=alert_time,
+        entry_low=299.37,
+        entry_high=299.69,
+        stop_loss=300.97,
+        target1=298.09,
+        target2=296.65,
+        invalidation=300.97,
+        confidence=98,
+        risk_reward=1.0,
+        reasoning="IWM failed above prior day high.",
+        avoid_if="IWM reclaims the sweep high.",
+        market_condition="balanced",
+        status="alert_ready",
+        features={
+            "tactical_management": True,
+            "tactical_exit_r_multiple": 1.0,
+            "tactical_exit_price": 298.09,
+            "tactical_exit_action": "COVER/PARTIAL",
+        },
+    )
+    setup_id = store.insert_setup(setup)
+    store.insert_alert(setup_id, setup, "original IWM liquidity alert", delivered=True)
+    management_setup = SetupSignal(
+        **{
+            **setup.__dict__,
+            "setup_type": "Suggested sell/partial",
+            "created_at": alert_time + timedelta(minutes=8),
+            "status": "management",
+        }
+    )
+    store.insert_alert(
+        setup_id,
+        management_setup,
+        "SUGGESTED COVER/PARTIAL IWM",
+        delivered=True,
+    )
+    event_id = store.insert_source_paper_signal(
+        run_id,
+        setup_id=setup_id,
+        setup=setup,
+        mode=LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        source_key=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+        source_label=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+        notes="Synthetic backfilled managed IWM row.",
+        metadata={
+            "original_core_setup_id": setup_id,
+            "original_telegram_alert_sent": True,
+        },
+    )
+    store.upsert_candles(
+        [
+            Candle("IWM", "1m", alert_time + timedelta(minutes=12), 298.83, 299.57, 298.83, 299.06, 1000, "test"),
+            Candle("IWM", "1m", alert_time + timedelta(minutes=17), 299.97, 300.98, 299.97, 300.80, 1000, "test"),
+        ]
+    )
+
+    summary = refresh_live_source_outcomes(
+        store,
+        lambda store_obj: list_live_experimental_lane_paper_events(
+            store_obj,
+            LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        ),
+    )
+    event = store.list_rows("paper_events", 1)[0]
+
+    assert event["id"] == event_id
+    assert summary["wins"] == 1
+    assert summary["losses"] == 0
+    assert event["outcome"] == "win"
+    assert event["r_multiple"] == 1.0
+    metadata = json.loads(event["metadata_json"])
+    assert metadata["path_metrics"]["resolution"] == "telegram_management_alert"
 
 
 def test_current_live_100_paper_view_counts_only_core_strict_liquidity(tmp_path):
