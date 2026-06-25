@@ -104,6 +104,15 @@ def _alert_source_clause(source_key: str) -> str:
     return f"{source_expr} = ?"
 
 
+def _cap_countable_alert_clause() -> str:
+    return """
+        alerts.setup_type not in (
+            'Suggested sell/partial',
+            'Fast momentum expansion'
+        )
+    """
+
+
 def _max_drawdown_r(rows: List[Dict]) -> float:
     equity = 0.0
     peak = 0.0
@@ -747,7 +756,7 @@ class SQLiteStore:
                 select count(*) as count from alerts
                 left join setups s on s.id = alerts.setup_id
                 where alerts.symbol = ?
-                  and alerts.setup_type != 'Suggested sell/partial'
+                  and {_cap_countable_alert_clause()}
                   and substr(alerts.created_at, 1, 10) = ?
                   and {source_clause}
                 """,

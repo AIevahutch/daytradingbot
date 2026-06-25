@@ -29,6 +29,7 @@ from trading_bot.settings import Settings
 from trading_bot.signal_sources import (
     CARTER_SIGNAL_SOURCE,
     CARTER_SOURCE_LABEL,
+    CORE_SIGNAL_SOURCE,
     CORE_SOURCE_LABEL,
     FAILED_AUCTION_TRAP_SIGNAL_SOURCE,
     FAILED_AUCTION_TRAP_SOURCE_LABEL,
@@ -253,6 +254,48 @@ class FakeHighPotentialLiquiditySweepStrategy:
                     "peer_biases": {
                         "SPY": "bearish",
                         "QQQ": "bearish",
+                        "IWM": "neutral",
+                    },
+                },
+            )
+        ]
+
+
+class FakeCoreLiquiditySweep100Strategy:
+    def detect(
+        self,
+        symbol,
+        candles_by_tf,
+        levels,
+        market_biases,
+        stale_data=False,
+        alert_timeframes=None,
+    ):
+        return [
+            SetupSignal(
+                symbol=symbol,
+                setup_type="Liquidity sweep reversal",
+                direction="LONG",
+                timeframe="5m",
+                created_at=utc_now(),
+                entry_low=100.0,
+                entry_high=100.2,
+                stop_loss=99.5,
+                target1=101.2,
+                target2=102.2,
+                invalidation=99.5,
+                risk_reward=1.0,
+                reasoning="Synthetic 100/100 liquidity sweep.",
+                avoid_if="Synthetic invalidation.",
+                features={
+                    "timeframe_aligned": True,
+                    "level_confluence": True,
+                    "vwap_confirmed": True,
+                    "volume_confirmed": True,
+                    "market_confirmed": True,
+                    "peer_biases": {
+                        "SPY": "bullish",
+                        "QQQ": "bullish",
                         "IWM": "neutral",
                     },
                 },
@@ -631,6 +674,129 @@ def test_scanner_paper_tracks_high_potential_liquidity_sweep_without_telegram(tm
     assert metadata["telegram_sent"] is False
     assert metadata["signal_source"] == HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE
     assert metadata["blocked_core_confidence"] == 79
+
+
+def test_core_alert_cap_excludes_fast_momentum_entries(tmp_path):
+    settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "cap_count.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    setup_time = utc_now()
+    prior_setups = [
+        SetupSignal(
+            symbol="SPY",
+            setup_type="Fast momentum expansion",
+            direction="LONG",
+            timeframe="5m",
+            created_at=setup_time,
+            entry_low=100.0,
+            entry_high=100.2,
+            stop_loss=99.5,
+            target1=101.2,
+            target2=102.2,
+            invalidation=99.5,
+            confidence=100,
+            risk_reward=1.0,
+            reasoning="Old fast momentum alert before it became dashboard-only.",
+            avoid_if="Momentum fails.",
+            status="alert_ready",
+        ),
+        SetupSignal(
+            symbol="SPY",
+            setup_type="Liquidity sweep reversal",
+            direction="LONG",
+            timeframe="30m",
+            created_at=setup_time,
+            entry_low=100.0,
+            entry_high=100.2,
+            stop_loss=99.5,
+            target1=101.2,
+            target2=102.2,
+            invalidation=99.5,
+            confidence=94,
+            risk_reward=1.0,
+            reasoning="Prior core alert.",
+            avoid_if="Sweep fails.",
+            status="alert_ready",
+        ),
+        SetupSignal(
+            symbol="SPY",
+            setup_type="Strat 2-1-2 continuation",
+            direction="SHORT",
+            timeframe="1h",
+            created_at=setup_time,
+            entry_low=100.0,
+            entry_high=100.2,
+            stop_loss=101.0,
+            target1=99.0,
+            target2=98.0,
+            invalidation=101.0,
+            confidence=93,
+            risk_reward=1.0,
+            reasoning="Prior lower-quality core alert.",
+            avoid_if="Trend fails.",
+            status="alert_ready",
+        ),
+    ]
+    for setup in prior_setups:
+        setup_id = store.insert_setup(setup)
+        store.insert_alert(setup_id, setup, f"prior {setup.setup_type}", delivered=True)
+
+    assert store.alert_count_today_for_source("SPY", CORE_SIGNAL_SOURCE) == 2
+
+
+def test_scanner_allows_100_liquidity_sweep_after_daily_cap(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "cap_override.sqlite"),
+        telegram_retry_delay_seconds=0,
+        max_alerts_per_symbol_per_day=3,
+    )
+    settings.research["enabled"] = False
+    settings.strategy["duplicate_alert_minutes"] = 0
+    settings.strategy["symbol_alert_cooldown_minutes"] = 0
+    store = SQLiteStore(settings.database_file)
+    setup_time = utc_now()
+    for index in range(3):
+        prior = SetupSignal(
+            symbol="SPY",
+            setup_type=f"Prior core alert {index}",
+            direction="LONG",
+            timeframe="15m",
+            created_at=setup_time,
+            entry_low=100.0,
+            entry_high=100.2,
+            stop_loss=99.5,
+            target1=101.2,
+            target2=102.2,
+            invalidation=99.5,
+            confidence=90,
+            risk_reward=1.0,
+            reasoning="Prior capped alert.",
+            avoid_if="Synthetic invalidation.",
+            status="alert_ready",
+        )
+        setup_id = store.insert_setup(prior)
+        store.insert_alert(setup_id, prior, "prior capped alert", delivered=True)
+    old_alert_time = (utc_now() - timedelta(hours=2)).replace(microsecond=0).isoformat()
+    with store.connect() as conn:
+        conn.execute("update alerts set created_at = ?", (old_alert_time,))
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert any("Core Model SPY" in item for item in outcome["alerts"])
+    assert not any("daily alert cap reached" in item for item in outcome["no_trade"])
+    assert len(telegram.messages) == 1
+    assert "Liquidity sweep reversal" in telegram.messages[0]
 
 
 def test_experimental_lane_metrics_separate_open_and_closed_signals(tmp_path):

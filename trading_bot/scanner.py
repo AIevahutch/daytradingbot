@@ -239,7 +239,8 @@ class TradingScanner:
 
             scored, setup_id = chosen_record
             if (
-                self.store.alert_count_today_for_source(symbol, CORE_SIGNAL_SOURCE)
+                not _daily_cap_override_allowed(scored)
+                and self.store.alert_count_today_for_source(symbol, CORE_SIGNAL_SOURCE)
                 >= self.settings.max_alerts_per_symbol_per_day
             ):
                 result["no_trade"].append(f"Core Model {symbol}: daily alert cap reached")
@@ -706,6 +707,14 @@ def _is_high_potential_liquidity_sweep(setup: SetupSignal, settings: Settings) -
     return all(
         str(peer_biases.get(symbol, "")).lower() == expected_bias
         for symbol in required_symbols
+    )
+
+
+def _daily_cap_override_allowed(setup: SetupSignal) -> bool:
+    return (
+        setup.setup_type == "Liquidity sweep reversal"
+        and int(setup.confidence or 0) >= 100
+        and setup.status == "alert_ready"
     )
 
 
