@@ -732,6 +732,70 @@ def test_scanner_sends_tactical_exit_alert_once(tmp_path):
     assert any(row["setup_type"] == "Suggested sell/partial" for row in alerts)
 
 
+def test_scanner_suppresses_tactical_exit_for_currently_blocked_original_alert(tmp_path):
+    settings = Settings(symbols=["IWM"], database_path=str(tmp_path / "blocked_sell.sqlite"))
+    settings.research["enabled"] = False
+    store = SQLiteStore(settings.database_file)
+    setup_time = utc_now() - timedelta(minutes=10)
+    setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="15m",
+        created_at=setup_time,
+        entry_low=298.90,
+        entry_high=299.10,
+        stop_loss=299.75,
+        target1=298.05,
+        target2=297.20,
+        invalidation=299.75,
+        confidence=98,
+        risk_reward=1.0,
+        reasoning="IWM swept above prior day high and failed.",
+        avoid_if="IWM reclaims the sweep high.",
+        market_condition="balanced",
+        status="alert_ready",
+        features={
+            "level_confluence": True,
+            "vwap_confirmed": True,
+            "volume_confirmed": True,
+            "timeframe_aligned": True,
+            "market_confirmed": False,
+            "peer_biases": {
+                "SPY": "bearish",
+                "QQQ": "bearish",
+                "IWM": "neutral",
+            },
+            "tactical_management": True,
+            "tactical_exit_r_multiple": 1.0,
+            "tactical_exit_price": 298.05,
+            "tactical_exit_action": "COVER/PARTIAL",
+        },
+    )
+    setup_id = store.insert_setup(setup)
+    store.insert_alert(setup_id, setup, "original balanced liquidity alert", delivered=True)
+    candles = [
+        Candle("IWM", "1m", setup_time + timedelta(minutes=1), 299.0, 299.1, 298.8, 298.9, 1000, "test"),
+        Candle("IWM", "1m", setup_time + timedelta(minutes=2), 298.9, 299.0, 298.0, 298.05, 1200, "test"),
+    ]
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=TacticalExitDataEngine(candles),
+        telegram=telegram,
+    )
+    scanner.strategy = EmptyStrategy()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert not any("suggested sell/partial" in item for item in outcome["alerts"])
+    assert telegram.messages == []
+    alerts = store.list_rows("alerts", 10)
+    assert all(row["setup_type"] != "Suggested sell/partial" for row in alerts)
+
+
 def test_historical_replay_records_paper_events(tmp_path):
     settings = Settings(database_path=str(tmp_path / "replay.sqlite"))
     store = SQLiteStore(settings.database_file)

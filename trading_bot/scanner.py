@@ -27,7 +27,10 @@ from trading_bot.models import Candle, SetupSignal
 from trading_bot.psychology.no_trade import NoTradeEngine
 from trading_bot.research.agent import current_session_date
 from trading_bot.research.gating import apply_research_gate, research_gate_context
-from trading_bot.scoring.scoring import ConfidenceScorer
+from trading_bot.scoring.scoring import (
+    ConfidenceScorer,
+    strict_liquidity_sweep_exception_allowed,
+)
 from trading_bot.scoring.selection import ranked_records
 from trading_bot.settings import Settings
 from trading_bot.signal_sources import (
@@ -458,6 +461,8 @@ class TradingScanner:
                 continue
             if _tactical_exit_state(setup, one_minute, exit_price) != "target":
                 continue
+            if not _tactical_exit_followup_allowed(setup, self.settings):
+                continue
             message = format_tactical_exit_alert(
                 setup,
                 price=exit_price,
@@ -562,6 +567,20 @@ def _exclude_setup_types(
     if not excluded:
         return setups
     return [setup for setup in setups if setup.setup_type not in excluded]
+
+
+def _tactical_exit_followup_allowed(setup: SetupSignal, settings: Settings) -> bool:
+    if setup.status != "alert_ready" or setup.confidence < settings.alert_threshold:
+        return False
+    market_condition = str(setup.market_condition or "").lower()
+    if market_condition not in {"balanced", "mixed", "chop"}:
+        return True
+    return strict_liquidity_sweep_exception_allowed(
+        setup,
+        setup.features or {},
+        int(setup.confidence or 0),
+        settings,
+    )
 
 
 def _tactical_exit_state(

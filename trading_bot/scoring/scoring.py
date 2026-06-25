@@ -143,6 +143,13 @@ class ConfidenceScorer:
             add_penalty,
             hard_blocks,
         )
+        self._apply_balanced_market_alert_gate(
+            setup,
+            features,
+            market_condition,
+            hard_blocks,
+            current_score=lambda: int(round(score)),
+        )
 
         no_trade = no_trade or {}
         research = no_trade.get("research") or {}
@@ -363,6 +370,28 @@ class ConfidenceScorer:
         )
         hard_blocks.extend(failures)
 
+    def _apply_balanced_market_alert_gate(
+        self,
+        setup: SetupSignal,
+        features: Dict,
+        market_condition: str,
+        hard_blocks: list,
+        current_score,
+    ) -> None:
+        if market_condition not in {"balanced", "mixed", "chop"}:
+            return
+        if strict_liquidity_sweep_exception_allowed(
+            setup,
+            features,
+            current_score(),
+            self.settings,
+        ):
+            setup.features["balanced_market_exception"] = "strict_liquidity_sweep_100"
+            return
+        hard_blocks.append(
+            "balanced/mixed market requires strict 100/100 liquidity sweep exception"
+        )
+
     def _apply_vwap_quality_gate(
         self,
         setup: SetupSignal,
@@ -551,3 +580,34 @@ def _all_index_trend_continuation_override_allowed(
 
     bias_keys = ("day_bias", "hour_bias", "thirty_bias", "fifteen_bias", "primary_bias")
     return all(str(features.get(key, "")).lower() == expected_bias for key in bias_keys)
+
+
+def strict_liquidity_sweep_exception_allowed(
+    setup: SetupSignal,
+    features: Dict,
+    score: int,
+    settings: Settings,
+) -> bool:
+    if setup.setup_type != "Liquidity sweep reversal":
+        return False
+    if str(setup.timeframe) not in {"15m", "30m"}:
+        return False
+    if score < 100:
+        return False
+
+    expected_bias = "bullish" if str(setup.direction).upper() == "LONG" else "bearish"
+    peer_biases = features.get("peer_biases") or {}
+    required_symbols = settings.strategy.get("strict_index_alignment_symbols") or [
+        "SPY",
+        "QQQ",
+    ]
+    if isinstance(required_symbols, str):
+        required_symbols = [
+            symbol.strip()
+            for symbol in required_symbols.split(",")
+            if symbol.strip()
+        ]
+    return all(
+        str(peer_biases.get(symbol, "")).lower() == expected_bias
+        for symbol in required_symbols
+    )

@@ -523,7 +523,7 @@ def test_all_index_aligned_strat_short_can_override_research_block_as_trend_expa
     assert scored.features["score_breakdown"]["hard_blocks"] == []
 
 
-def test_balanced_quality_bonus_rewards_clean_level_setups_without_overriding_blocks():
+def test_balanced_quality_bonus_records_context_without_overriding_alert_gate():
     settings = Settings(
         alert_threshold=80,
         scoring_weights={
@@ -574,12 +574,96 @@ def test_balanced_quality_bonus_rewards_clean_level_setups_without_overriding_bl
     ]
 
     assert "balanced_quality_bonus" in factors
-    assert scored.confidence == 98
+    assert scored.features["score_breakdown"]["raw_score"] == 98
+    assert scored.confidence == settings.alert_threshold - 1
+    assert scored.status == "blocked"
+    assert any(
+        "balanced/mixed market requires strict 100/100 liquidity sweep exception" in block
+        for block in scored.features["score_breakdown"]["hard_blocks"]
+    )
 
     weak = SetupSignal(**{**setup.__dict__, "features": {**setup.features, "weak_volume": True}})
     weak_scored = scorer.score(weak, {"market_condition": "balanced"})
     assert weak_scored.status == "blocked"
     assert weak_scored.confidence < settings.alert_threshold
+
+
+def test_balanced_liquidity_sweep_must_be_strict_100_point_exception():
+    settings = Settings()
+    scorer = ConfidenceScorer(settings)
+    setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="15m",
+        created_at=utc_now(),
+        entry_low=298.90,
+        entry_high=299.10,
+        stop_loss=299.75,
+        target1=298.05,
+        target2=297.20,
+        invalidation=299.75,
+        risk_reward=1.0,
+        features={
+            "level_confluence": True,
+            "vwap_confirmed": True,
+            "volume_confirmed": True,
+            "timeframe_aligned": True,
+            "market_confirmed": False,
+            "peer_biases": {
+                "SPY": "bearish",
+                "QQQ": "bearish",
+                "IWM": "neutral",
+            },
+        },
+    )
+
+    scored = scorer.score(setup, {"market_condition": "balanced"})
+
+    assert scored.confidence == settings.alert_threshold - 1
+    assert scored.status == "blocked"
+    assert any(
+        "balanced/mixed market requires strict 100/100 liquidity sweep exception" in block
+        for block in scored.features["score_breakdown"]["hard_blocks"]
+    )
+
+
+def test_balanced_liquidity_sweep_allows_strict_100_point_exception():
+    settings = Settings()
+    scorer = ConfidenceScorer(settings)
+    setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="15m",
+        created_at=utc_now(),
+        entry_low=298.90,
+        entry_high=299.10,
+        stop_loss=299.75,
+        target1=298.05,
+        target2=297.20,
+        invalidation=299.75,
+        risk_reward=1.0,
+        features={
+            "level_confluence": True,
+            "vwap_confirmed": True,
+            "volume_confirmed": True,
+            "timeframe_aligned": True,
+            "market_confirmed": True,
+            "peer_biases": {
+                "SPY": "bearish",
+                "QQQ": "bearish",
+                "IWM": "neutral",
+            },
+        },
+    )
+
+    scored = scorer.score(setup, {"market_condition": "balanced"})
+
+    assert scored.confidence == 100
+    assert scored.status == "alert_ready"
+    assert scored.features["balanced_market_exception"] == "strict_liquidity_sweep_100"
+    assert scored.features["score_breakdown"]["hard_blocks"] == []
 
 
 def test_mixed_spy_qqq_alignment_blocks_core_alert():
