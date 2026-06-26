@@ -6,6 +6,12 @@ import sqlite3
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional
 
+from trading_bot.day_trade_contract import (
+    DAY_TRADE_OUTCOME,
+    candles_through_day_trade_expiry,
+    mark_expired_day_trade,
+    tighten_day_trade_signal,
+)
 from trading_bot.models import SetupSignal, utc_now
 from trading_bot.replay import _outcome_metrics_for_setup
 from trading_bot.signal_sources import (
@@ -55,6 +61,7 @@ GRADUATION_MIN_TRADING_DAYS = 3
 def refresh_live_100_outcomes(
     store: SQLiteStore,
     excluded_setup_types: Optional[Iterable[str]] = None,
+    day_trade_config: Optional[Dict] = None,
 ) -> Dict[str, int]:
     return refresh_live_source_outcomes(
         store,
@@ -62,6 +69,7 @@ def refresh_live_100_outcomes(
             store_obj,
             excluded_setup_types,
         ),
+        day_trade_config=day_trade_config,
     )
 
 
@@ -98,9 +106,14 @@ def current_failed_auction_trap_snapshot(store: SQLiteStore) -> tuple[Dict[str, 
 def refresh_all_live_outcomes(
     store: SQLiteStore,
     excluded_setup_types: Optional[Iterable[str]] = None,
+    day_trade_config: Optional[Dict] = None,
 ) -> Dict[str, Dict]:
     refreshers = {
-        "core": lambda: refresh_live_100_outcomes(store, excluded_setup_types),
+        "core": lambda: refresh_live_100_outcomes(
+            store,
+            excluded_setup_types,
+            day_trade_config=day_trade_config,
+        ),
         "carter_put": lambda: refresh_live_carter_put_outcomes(store),
         "failed_auction_trap": lambda: refresh_live_failed_auction_trap_outcomes(store),
     }
@@ -117,7 +130,9 @@ def refresh_all_live_outcomes(
 
 
 def refresh_live_source_outcomes(
-    store: SQLiteStore, list_events: Callable[[SQLiteStore], List[Dict]]
+    store: SQLiteStore,
+    list_events: Callable[[SQLiteStore], List[Dict]],
+    day_trade_config: Optional[Dict] = None,
 ) -> Dict[str, int]:
     events = list_events(store)
     updated = 0
@@ -134,11 +149,27 @@ def refresh_live_source_outcomes(
         ]
         if not future:
             continue
+        tighten_day_trade_signal(setup, day_trade_config)
         managed_setup, management_metadata = _one_r_managed_setup(setup)
+        day_trade_future = candles_through_day_trade_expiry(
+            future,
+            event_time,
+            day_trade_config,
+        )
+        if not day_trade_future:
+            day_trade_future = future
         outcome, r_multiple, path_metrics = _outcome_metrics_for_setup(
             managed_setup,
-            future,
+            day_trade_future,
         )
+        if outcome == "open" and future[-1].timestamp > day_trade_future[-1].timestamp:
+            outcome = DAY_TRADE_OUTCOME
+            r_multiple = 0.0
+            path_metrics = mark_expired_day_trade(
+                path_metrics,
+                event_time,
+                day_trade_config,
+            )
         if _has_existing_management_win(store, event, metadata):
             outcome = "win"
             r_multiple = 1.0
@@ -152,6 +183,8 @@ def refresh_live_source_outcomes(
         merged_metadata = {
             **metadata,
             **management_metadata,
+            "day_trade_adjustment": setup.features.get("day_trade_adjustment"),
+            "day_trade_contract": setup.features.get("day_trade_contract"),
             "path_metrics": path_metrics,
             "evaluated_at": utc_now().replace(microsecond=0).isoformat(),
             "latest_1m_candle_at": future[-1].timestamp.isoformat(),
@@ -314,15 +347,17 @@ def update_paper_event_outcome(
 def live_100_summary(events: List[Dict]) -> Dict[str, int]:
     wins = [event for event in events if event.get("outcome") == "win"]
     losses = [event for event in events if event.get("outcome") == "loss"]
+    expired = [event for event in events if event.get("outcome") == DAY_TRADE_OUTCOME]
     open_events = [event for event in events if event.get("outcome") == "open"]
     not_triggered = [event for event in events if event.get("outcome") == "not_triggered"]
     return {
         "alerted": len(events),
         "wins": len(wins),
         "losses": len(losses),
+        "expired_daytrade": len(expired),
         "open": len(open_events),
         "not_triggered": len(not_triggered),
-        "closed": len(wins) + len(losses),
+        "closed": len(wins) + len(losses) + len(expired),
     }
 
 
@@ -338,7 +373,7 @@ def _experimental_lane_summary(config: Dict, events: List[Dict]) -> Dict:
     closed_events = [
         event
         for event in events
-        if event.get("outcome") in {"win", "loss", "breakeven"}
+        if event.get("outcome") in {"win", "loss", "breakeven", DAY_TRADE_OUTCOME}
     ]
     wins = [
         event

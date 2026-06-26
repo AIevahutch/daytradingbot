@@ -1127,6 +1127,100 @@ def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     assert metadata["path_metrics"]["resolution"] == "target1"
 
 
+def test_live_100_paper_tightens_wide_day_trade_levels_before_outcome(tmp_path):
+    settings = Settings(symbols=["QQQ"], database_path=str(tmp_path / "wide_daytrade_win.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    run_id = store.get_or_create_paper_run("live_100_alerts", "2026-06-25", ["QQQ"])
+    alert_time = datetime(2026, 6, 25, 14, 25, 14)
+    setup = SetupSignal(
+        symbol="QQQ",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="30m",
+        created_at=alert_time,
+        entry_low=705.76,
+        entry_high=719.93,
+        stop_loss=726.76,
+        target1=698.93,
+        target2=685.01,
+        invalidation=726.76,
+        confidence=100,
+        risk_reward=1.0,
+        reasoning="Synthetic wide but directionally valid short.",
+        avoid_if="Synthetic invalidation.",
+        market_condition="trending",
+        status="alert_ready",
+    )
+    event_id = store.insert_live_paper_alert(run_id, alert_id=10, setup_id=20, setup=setup)
+    store.upsert_candles(
+        [
+            Candle("QQQ", "1m", datetime(2026, 6, 25, 14, 26), 715.0, 719.0, 714.0, 716.0, 1000, "test"),
+            Candle("QQQ", "1m", datetime(2026, 6, 25, 19, 55), 710.0, 711.0, 706.0, 707.0, 1000, "test"),
+            Candle("QQQ", "1m", datetime(2026, 6, 26, 13, 34), 703.5, 704.0, 702.8, 703.0, 1000, "test"),
+        ]
+    )
+
+    summary = refresh_live_100_outcomes(store)
+    event = store.list_rows("paper_events", 1)[0]
+
+    assert event["id"] == event_id
+    assert event["outcome"] == "win"
+    assert event["r_multiple"] == 1.0
+    assert summary["wins"] == 1
+    assert summary["closed"] == 1
+    metadata = json.loads(event["metadata_json"])
+    assert metadata["day_trade_adjustment"]["adjusted"] is True
+    assert metadata["paper_target1"] == 712.93
+    assert metadata["path_metrics"]["resolution"] == "target1"
+
+
+def test_live_100_paper_expires_unresolved_day_trade_at_same_day_cutoff(tmp_path):
+    settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "daytrade_expiry.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    run_id = store.get_or_create_paper_run("live_100_alerts", "2026-06-25", ["SPY"])
+    alert_time = datetime(2026, 6, 25, 14, 25, 14)
+    setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="15m",
+        created_at=alert_time,
+        entry_low=540.0,
+        entry_high=541.0,
+        stop_loss=539.5,
+        target1=541.5,
+        target2=542.5,
+        invalidation=539.5,
+        confidence=100,
+        risk_reward=1.0,
+        reasoning="Synthetic tight day-trade long.",
+        avoid_if="Synthetic invalidation.",
+        market_condition="trending",
+        status="alert_ready",
+    )
+    event_id = store.insert_live_paper_alert(run_id, alert_id=10, setup_id=20, setup=setup)
+    store.upsert_candles(
+        [
+            Candle("SPY", "1m", datetime(2026, 6, 25, 14, 26), 540.5, 541.2, 540.2, 541.0, 1000, "test"),
+            Candle("SPY", "1m", datetime(2026, 6, 25, 19, 55), 541.0, 541.4, 540.8, 541.2, 1000, "test"),
+            Candle("SPY", "1m", datetime(2026, 6, 26, 13, 34), 541.2, 541.7, 541.1, 541.6, 1000, "test"),
+        ]
+    )
+
+    summary = refresh_live_100_outcomes(store)
+    event = store.list_rows("paper_events", 1)[0]
+
+    assert event["id"] == event_id
+    assert event["outcome"] == "expired_daytrade"
+    assert event["r_multiple"] == 0.0
+    assert summary["expired_daytrade"] == 1
+    assert summary["closed"] == 1
+    metadata = json.loads(event["metadata_json"])
+    assert metadata["path_metrics"]["resolution"] == "expired_daytrade"
+    assert metadata["path_metrics"]["mfe_r"] < 1.0
+    assert metadata["path_metrics"]["expired_at"].endswith("19:55:00")
+
+
 def test_current_live_snapshot_is_read_only_when_refresh_would_lock(tmp_path, monkeypatch):
     settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "snapshot_read_only.sqlite"))
     store = SQLiteStore(settings.database_file)

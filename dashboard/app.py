@@ -2345,7 +2345,7 @@ with paper_tab:
     tracking_since = "-"
     if not live_events.empty:
         tracking_since = format_datetime(live_events["event_time"].min(), include_relative=False)
-    live_cols = st.columns(7)
+    live_cols = st.columns(8)
     closed_live = live_summary.get("closed", 0)
     live_win_rate = (
         f"{live_summary.get('wins', 0) / closed_live * 100:.1f}%"
@@ -2355,15 +2355,17 @@ with paper_tab:
     live_cols[0].metric("Core Alerts", live_summary.get("alerted", 0))
     live_cols[1].metric("Wins", live_summary.get("wins", 0))
     live_cols[2].metric("Losses", live_summary.get("losses", 0))
-    live_cols[3].metric("Still Open", live_summary.get("open", 0))
-    live_cols[4].metric("Not Triggered", live_summary.get("not_triggered", 0))
-    live_cols[5].metric("Win Rate", live_win_rate)
-    live_cols[6].metric("Tracking Since", tracking_since)
+    live_cols[3].metric("Expired", live_summary.get("expired_daytrade", 0))
+    live_cols[4].metric("Still Open", live_summary.get("open", 0))
+    live_cols[5].metric("Not Triggered", live_summary.get("not_triggered", 0))
+    live_cols[6].metric("Win Rate", live_win_rate)
+    live_cols[7].metric("Tracking Since", tracking_since)
     st.caption(
         "This section only counts 100/100 Liquidity Sweep Reversal rows on 15m/30m. "
         "Fast Momentum, premarket/previous-day breaks, VWAP, 1h liquidity, and experimental lanes are excluded from core. "
         "A win means the +1R paper target hit after entry triggered. "
-        "A loss means stop hit first. Open means entry triggered but target/stop has not resolved yet. "
+        "A loss means stop hit first. Expired means a triggered day trade did not hit target or stop before the same-day cutoff. "
+        "Open means entry triggered but target/stop has not resolved yet during the active session. "
         "Raw historical rows remain archived for research."
     )
     if live_events.empty:

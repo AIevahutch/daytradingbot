@@ -56,6 +56,14 @@ _Avoid_: Core setup, production setup
 The paper-trading pass/fail measure for whether a setup reaches +1R before invalidation. It evaluates setup quality separately from partial-profit execution plans.
 _Avoid_: Full trade plan, sell rule
 
+**Day-Trade Contract**:
+The rule set that decides whether an otherwise valid setup is tight enough for Eva's same-session index options alerts. It checks timeframe, entry-zone width, risk per share, target distance, and same-day expiration. A setup can have a good directional thesis but fail the Day-Trade Contract if the entry, stop, or target is too wide for a practical day trade.
+_Avoid_: Swing-trade stop, wide alert, eventually-right setup
+
+**Expired Day Trade**:
+A paper-tracked alert that triggered but did not hit the +1R target or invalidation before the same-day cutoff. It is closed for day-trade quality metrics and should not remain open across sessions.
+_Avoid_: Still open, unresolved winner
+
 **Partial-Profit Plan**:
 The manual execution idea of selling about 70% of contracts at +1R and optionally letting the remainder seek a larger target. It is not the same thing as the signal quality benchmark.
 _Avoid_: Paper win rule, setup score

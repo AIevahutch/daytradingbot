@@ -15,6 +15,7 @@ from trading_bot.alerts.telegram import (
     tactical_exit_price,
 )
 from trading_bot.alert_policy import is_core_telegram_entry_allowed
+from trading_bot.day_trade_contract import config_from_settings
 from trading_bot.carter_squeeze import CarterSqueezeEngine
 from trading_bot.data.market_data import (
     DataUnavailable,
@@ -319,6 +320,7 @@ class TradingScanner:
             summaries = live_paper.refresh_all_live_outcomes(
                 self.store,
                 set(getattr(self.settings, "excluded_setup_types", []) or []),
+                day_trade_config=config_from_settings(self.settings),
             )
         except Exception as exc:
             logger.warning("Paper outcome refresh failed: %s", exc)

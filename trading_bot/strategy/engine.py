@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional
 
 from trading_bot.data.market_data import completed_candles_for_timeframe
+from trading_bot.day_trade_contract import tighten_day_trade_signal
 from trading_bot.levels.levels import level_map
 from trading_bot.models import Candle, Level, SetupSignal, utc_now
 
@@ -145,7 +146,7 @@ def _build_signal(
             "SELL/PARTIAL" if direction == "LONG" else "COVER/PARTIAL"
         )
     rr = _risk_reward(direction, entry_mid, stop_loss, target1)
-    return SetupSignal(
+    signal = SetupSignal(
         symbol=symbol,
         setup_type=setup_type,
         direction=direction,
@@ -162,6 +163,8 @@ def _build_signal(
         avoid_if=avoid_if,
         features=features,
     )
+    tighten_day_trade_signal(signal)
+    return signal
 
 
 class StrategyEngine:

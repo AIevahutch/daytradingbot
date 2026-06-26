@@ -265,6 +265,29 @@ class Settings:
             "spy_vwap_reclaim_min_volume_ratio": 1.5,
             "spy_vwap_reclaim_min_body_ratio": 0.45,
             "spy_vwap_reclaim_min_close_position": 0.7,
+            "day_trade_contract": {
+                "enabled": True,
+                "timezone": "America/New_York",
+                "exit_time": "15:55",
+                "allowed_timeframes": ["15m", "30m"],
+                "symbol_limits": {
+                    "SPY": {
+                        "max_entry_width": 2.50,
+                        "max_risk_per_share": 3.00,
+                        "max_target_distance": 3.00,
+                    },
+                    "QQQ": {
+                        "max_entry_width": 4.00,
+                        "max_risk_per_share": 5.00,
+                        "max_target_distance": 5.00,
+                    },
+                    "IWM": {
+                        "max_entry_width": 1.25,
+                        "max_risk_per_share": 1.50,
+                        "max_target_distance": 1.50,
+                    },
+                },
+            },
         }
     )
     scoring_weights: Dict[str, int] = field(

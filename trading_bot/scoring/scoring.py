@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
+from trading_bot.day_trade_contract import annotate_day_trade_contract, config_from_settings
 from trading_bot.models import SetupSignal
 from trading_bot.settings import Settings
 
@@ -150,6 +151,7 @@ class ConfidenceScorer:
             hard_blocks,
             current_score=lambda: int(round(score)),
         )
+        self._annotate_day_trade_contract(setup)
 
         no_trade = no_trade or {}
         research = no_trade.get("research") or {}
@@ -261,6 +263,11 @@ class ConfidenceScorer:
 
     def is_alertable(self, setup: SetupSignal) -> bool:
         return setup.status == "alert_ready" and setup.confidence >= self.settings.alert_threshold
+
+    def _annotate_day_trade_contract(self, setup: SetupSignal) -> None:
+        if setup.setup_type != "Liquidity sweep reversal":
+            return
+        annotate_day_trade_contract(setup, config_from_settings(self.settings))
 
     def _apply_strict_index_alignment_gate(
         self,

@@ -628,6 +628,91 @@ def test_balanced_liquidity_sweep_must_be_strict_100_point_exception():
     )
 
 
+def test_strategy_tightens_wide_liquidity_sweep_to_day_trade_levels():
+    last = Candle(
+        "QQQ",
+        "30m",
+        datetime(2026, 6, 25, 10, 25),
+        724.0,
+        726.76,
+        704.5,
+        705.76,
+        9000,
+        "test",
+    )
+    common = {
+        "primary_timeframe": "30m",
+        "signal_timestamp": last.timestamp.isoformat(),
+        "signal_source": "test",
+        "peer_biases": {"SPY": "bearish", "QQQ": "bearish"},
+        "market_confirmed": True,
+        "volume_confirmed": True,
+        "conflicting_timeframes": False,
+    }
+
+    signals = StrategyEngine._liquidity_sweeps(
+        "QQQ",
+        last,
+        {"previous_day_high": 719.93, "vwap": 710.0},
+        common,
+    )
+
+    setup = signals[0]
+    entry_mid = (setup.entry_low + setup.entry_high) / 2
+    risk = abs(entry_mid - setup.stop_loss)
+    assert setup.direction == "SHORT"
+    assert setup.entry_high == 719.93
+    assert round(setup.entry_high - setup.entry_low, 2) == 4.0
+    assert round(risk, 2) == 5.0
+    assert round(entry_mid - setup.target1, 2) == 5.0
+    assert round(entry_mid - setup.target2, 2) == 10.0
+    assert setup.features["day_trade_adjustment"]["adjusted"] is True
+    assert setup.features["day_trade_contract"]["eligible"] is True
+
+
+def test_core_liquidity_sweep_records_wide_day_trade_structure_without_blocking():
+    settings = Settings()
+    scorer = ConfidenceScorer(settings)
+    setup = SetupSignal(
+        symbol="QQQ",
+        setup_type="Liquidity sweep reversal",
+        direction="SHORT",
+        timeframe="30m",
+        created_at=utc_now(),
+        entry_low=705.76,
+        entry_high=719.93,
+        stop_loss=726.76,
+        target1=698.93,
+        target2=685.01,
+        invalidation=726.76,
+        risk_reward=1.0,
+        features={
+            "level_confluence": True,
+            "vwap_confirmed": True,
+            "volume_confirmed": True,
+            "timeframe_aligned": True,
+            "market_confirmed": True,
+            "peer_biases": {
+                "SPY": "bearish",
+                "QQQ": "bearish",
+            },
+        },
+    )
+
+    scored = scorer.score(setup, {"market_condition": "trending"})
+
+    assert scored.status == "alert_ready"
+    assert scored.confidence >= settings.alert_threshold
+    contract = scored.features["day_trade_contract"]
+    assert contract["eligible"] is False
+    assert contract["entry_width"] > contract["max_entry_width"]
+    assert contract["risk_per_share"] > contract["max_risk_per_share"]
+    assert not any(
+        "day-trade contract" in block
+        for block in scored.features["score_breakdown"]["hard_blocks"]
+    )
+
+
 def test_balanced_liquidity_sweep_allows_strict_100_point_exception():
     settings = Settings()
     scorer = ConfidenceScorer(settings)
