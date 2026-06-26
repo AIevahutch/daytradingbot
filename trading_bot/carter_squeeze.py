@@ -3,6 +3,7 @@ from __future__ import annotations
 from statistics import mean, pstdev
 from typing import Dict, List, Optional, Tuple
 
+from trading_bot.alert_policy import is_carter_put_telegram_entry_allowed
 from trading_bot.data.market_data import completed_candles_for_timeframe
 from trading_bot.models import Candle, SetupSignal
 from trading_bot.settings import Settings
@@ -29,7 +30,10 @@ class CarterSqueezeEngine:
         return bool(self.config.get("enabled", False))
 
     def is_alertable(self, setup: SetupSignal) -> bool:
-        return setup.status == "alert_ready" and setup.confidence >= self.settings.alert_threshold
+        return is_carter_put_telegram_entry_allowed(
+            setup.__dict__,
+            alert_threshold=self.settings.alert_threshold,
+        )
 
     def detect(
         self,

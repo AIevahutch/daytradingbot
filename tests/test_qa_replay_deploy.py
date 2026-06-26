@@ -1,6 +1,8 @@
 import json
+import sqlite3
 from datetime import datetime, timedelta
 
+import trading_bot.live_paper as live_paper_module
 from trading_bot.alerts.telegram import TelegramResult
 from trading_bot.data.market_data import (
     TIMEFRAME_MINUTES,
@@ -8,11 +10,13 @@ from trading_bot.data.market_data import (
     resample_candles,
 )
 from trading_bot.live_paper import (
+    current_live_100_snapshot,
     experimental_lane_summaries,
     list_live_experimental_lane_paper_events,
     list_live_failed_auction_trap_paper_events,
     list_live_carter_put_paper_events,
     list_current_live_100_paper_events,
+    refresh_all_live_outcomes,
     refresh_live_100_outcomes,
     refresh_live_source_outcomes,
 )
@@ -262,6 +266,9 @@ class FakeHighPotentialLiquiditySweepStrategy:
 
 
 class FakeCoreLiquiditySweep100Strategy:
+    def __init__(self, timeframe: str = "15m"):
+        self.timeframe = timeframe
+
     def detect(
         self,
         symbol,
@@ -276,7 +283,7 @@ class FakeCoreLiquiditySweep100Strategy:
                 symbol=symbol,
                 setup_type="Liquidity sweep reversal",
                 direction="LONG",
-                timeframe="5m",
+                timeframe=self.timeframe,
                 created_at=utc_now(),
                 entry_low=100.0,
                 entry_high=100.2,
@@ -329,19 +336,23 @@ class FixedConfidenceScorer:
 
 
 class FakeCarterSqueeze:
+    def __init__(self, direction: str = "SHORT"):
+        self.direction = direction
+
     def detect(self, symbol, context, market_biases, no_trade_state=None):
+        is_short = self.direction == "SHORT"
         setup = SetupSignal(
             symbol=symbol,
             setup_type="Carter Squeeze",
-            direction="LONG",
+            direction=self.direction,
             timeframe="15m",
             created_at=utc_now(),
             entry_low=100.0,
             entry_high=100.2,
-            stop_loss=99.0,
-            target1=102.2,
-            target2=103.2,
-            invalidation=99.0,
+            stop_loss=101.0 if is_short else 99.0,
+            target1=99.0 if is_short else 102.2,
+            target2=98.0 if is_short else 103.2,
+            invalidation=101.0 if is_short else 99.0,
             confidence=88,
             risk_reward=2.0,
             reasoning="Synthetic Carter squeeze release.",
@@ -362,7 +373,11 @@ class FakeCarterSqueeze:
         return [tag_alert_source(setup, CARTER_SIGNAL_SOURCE, CARTER_SOURCE_LABEL)]
 
     def is_alertable(self, setup):
-        return setup.status == "alert_ready" and setup.confidence >= 80
+        return (
+            setup.status == "alert_ready"
+            and setup.confidence >= 80
+            and setup.direction == "SHORT"
+        )
 
 
 class EmptyCarterSqueeze:
@@ -447,7 +462,11 @@ class RecordingTelegram:
 
 
 def test_scanner_persists_failed_telegram_attempt_and_heartbeat(tmp_path):
-    settings = Settings(database_path=str(tmp_path / "bot.sqlite"), telegram_retry_delay_seconds=0)
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "bot.sqlite"),
+        telegram_retry_delay_seconds=0,
+    )
     store = SQLiteStore(settings.database_file)
     store.upsert_research_brief(
         ResearchBrief(
@@ -468,7 +487,8 @@ def test_scanner_persists_failed_telegram_attempt_and_heartbeat(tmp_path):
         data_engine=FakeDataEngine(),
         telegram=FailingTelegram(),
     )
-    scanner.strategy = FakeStrategy()
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.scorer = FixedConfidenceScorer(100)
     scanner.no_trade = FakeNoTrade()
 
     outcome = scanner.scan_once()
@@ -501,7 +521,8 @@ def test_scanner_auto_papers_live_100_confidence_alerts_once(tmp_path):
         data_engine=FakeDataEngine(),
         telegram=RecordingTelegram(),
     )
-    scanner.strategy = FakeStrategy()
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.scorer = FixedConfidenceScorer(100)
     scanner.no_trade = FakeNoTrade()
 
     first = scanner.scan_once()
@@ -569,8 +590,9 @@ def test_scanner_runs_core_and_carter_alerts_in_parallel(tmp_path):
         data_engine=FakeDataEngine(),
         telegram=telegram,
     )
-    scanner.strategy = FakeStrategy()
     scanner.carter_squeeze = FakeCarterSqueeze()
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.scorer = FixedConfidenceScorer(100)
     scanner.no_trade = FakeNoTrade()
 
     outcome = scanner.scan_once()
@@ -578,7 +600,7 @@ def test_scanner_runs_core_and_carter_alerts_in_parallel(tmp_path):
     assert any(item.startswith("Core Model SPY") for item in outcome["alerts"])
     assert any(item.startswith("Carter Squeeze SPY") for item in outcome["alerts"])
     assert any("Signal source: Core Model" in message for message in telegram.messages)
-    assert any(message.startswith("CARTER SQUEEZE BUY SPY") for message in telegram.messages)
+    assert any(message.startswith("CARTER SQUEEZE SELL/SHORT SPY") for message in telegram.messages)
     paper_runs = store.list_rows("paper_runs", 10)
     assert {run["source"] for run in paper_runs} == {"live_100_alerts", LIVE_CARTER_PAPER_SOURCE}
     metadata = [json.loads(event["metadata_json"]) for event in store.list_rows("paper_events", 10)]
@@ -855,6 +877,98 @@ def test_core_80_to_94_setups_are_dashboard_only(tmp_path):
     assert store.list_rows("alerts", 10) == []
 
 
+def test_core_95_to_99_setups_are_dashboard_only(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "core_99_dashboard_only.sqlite"),
+        telegram_retry_delay_seconds=0,
+    )
+    settings.research["enabled"] = False
+    settings.strategy["duplicate_alert_minutes"] = 0
+    settings.strategy["symbol_alert_cooldown_minutes"] = 0
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy()
+    scanner.scorer = FixedConfidenceScorer(99)
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert outcome["alerts"] == []
+    assert telegram.messages == []
+    assert any("99/100 dashboard-only" in item for item in outcome["watch_only"])
+    assert store.list_rows("alerts", 10) == []
+
+
+def test_core_100_context_timeframe_is_dashboard_only(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "core_100_5m_dashboard_only.sqlite"),
+        telegram_retry_delay_seconds=0,
+    )
+    settings.research["enabled"] = False
+    settings.strategy["duplicate_alert_minutes"] = 0
+    settings.strategy["symbol_alert_cooldown_minutes"] = 0
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = FakeCoreLiquiditySweep100Strategy(timeframe="5m")
+    scanner.scorer = FixedConfidenceScorer(100)
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert outcome["alerts"] == []
+    assert telegram.messages == []
+    assert any("100/100 dashboard-only" in item for item in outcome["watch_only"])
+    assert store.list_rows("alerts", 10) == []
+
+
+def test_carter_call_side_stays_dashboard_only(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "carter_call_dashboard_only.sqlite"),
+        telegram_retry_delay_seconds=0,
+    )
+    settings.research["enabled"] = False
+    settings.carter_squeeze["duplicate_alert_minutes"] = 0
+    settings.carter_squeeze["symbol_alert_cooldown_minutes"] = 0
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = EmptyStrategy()
+    scanner.carter_squeeze = FakeCarterSqueeze(direction="LONG")
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    outcome = scanner.scan_once()
+
+    assert outcome["alerts"] == []
+    assert telegram.messages == []
+    assert any("Carter Squeeze SPY" in item for item in outcome["watch_only"])
+    assert store.list_rows("alerts", 10) == []
+
+
 def test_experimental_lane_metrics_separate_open_and_closed_signals(tmp_path):
     settings = Settings(database_path=str(tmp_path / "experimental_lanes.sqlite"))
     store = SQLiteStore(settings.database_file)
@@ -1011,6 +1125,91 @@ def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     assert metadata["paper_target1"] == 102.0
     assert metadata["original_target1"] == 103.5
     assert metadata["path_metrics"]["resolution"] == "target1"
+
+
+def test_current_live_snapshot_is_read_only_when_refresh_would_lock(tmp_path, monkeypatch):
+    settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "snapshot_read_only.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    run_id = store.get_or_create_paper_run("live_100_alerts", "2026-06-11", ["SPY"])
+    alert_time = datetime(2026, 6, 11, 10, 0)
+    setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="15m",
+        created_at=alert_time,
+        entry_low=100.0,
+        entry_high=101.0,
+        stop_loss=99.0,
+        target1=102.0,
+        target2=103.0,
+        invalidation=99.0,
+        confidence=100,
+        risk_reward=2.0,
+        reasoning="Synthetic live alert.",
+        avoid_if="Synthetic invalidation.",
+        market_condition="trending",
+        status="alert_ready",
+    )
+    store.insert_live_paper_alert(run_id, alert_id=10, setup_id=20, setup=setup)
+
+    def locked_refresh(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(live_paper_module, "refresh_live_100_outcomes", locked_refresh)
+
+    summary, events = current_live_100_snapshot(store)
+
+    assert summary["alerted"] == 1
+    assert summary["open"] == 1
+    assert events[0]["symbol"] == "SPY"
+
+
+def test_refresh_all_live_outcomes_reports_locked_lane(tmp_path, monkeypatch):
+    settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "refresh_all_locked.sqlite"))
+    store = SQLiteStore(settings.database_file)
+
+    def locked_refresh(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(live_paper_module, "refresh_live_100_outcomes", locked_refresh)
+    monkeypatch.setattr(live_paper_module, "refresh_live_carter_put_outcomes", lambda *_args: {"updated": 0})
+    monkeypatch.setattr(
+        live_paper_module,
+        "refresh_live_failed_auction_trap_outcomes",
+        lambda *_args: {"updated": 0},
+    )
+
+    summaries = refresh_all_live_outcomes(store)
+
+    assert summaries["core"] == {"updated": 0, "error": "database_locked"}
+    assert summaries["carter_put"] == {"updated": 0}
+    assert summaries["failed_auction_trap"] == {"updated": 0}
+
+
+def test_scanner_paper_refresh_hook_reports_updates_and_busy_database(tmp_path, monkeypatch):
+    settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "scanner_refresh.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    scanner = TradingScanner(settings, store)
+
+    monkeypatch.setattr(
+        live_paper_module,
+        "refresh_all_live_outcomes",
+        lambda *_args, **_kwargs: {
+            "core": {"updated": 2},
+            "carter_put": {"updated": 0, "error": "database_locked"},
+            "failed_auction_trap": {"updated": 0},
+        },
+    )
+    result = {"alerts": [], "watch_only": [], "no_trade": [], "errors": []}
+
+    scanner._refresh_paper_outcomes(result)
+
+    assert result["watch_only"] == ["Paper tracking: updated 2 outcome(s)"]
+    assert result["no_trade"] == [
+        "Paper tracking refresh skipped while database was busy: carter_put"
+    ]
+    assert result["errors"] == []
 
 
 def test_live_paper_honors_existing_tactical_exit_alert(tmp_path):

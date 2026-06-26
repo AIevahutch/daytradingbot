@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading_bot.analytics.performance import breakdowns, calculate_metrics, period_pl
 from trading_bot.analytics.recommendations import RecommendationEngine
+from trading_bot.alert_policy import is_current_approved_telegram_alert
 from trading_bot.alerts.telegram import TelegramClient
 from trading_bot.dashboard_refresh import enable_dashboard_auto_refresh
 from trading_bot.email.gmail import GmailSMTPClient
@@ -792,8 +793,20 @@ def active_alert_setup_for_symbol(
     symbol_alerts = symbol_alerts[symbol_alerts.apply(alert_is_active, axis=1)]
     if symbol_alerts.empty:
         return None
-    symbol_alerts = symbol_alerts.sort_values("created_at", ascending=False)
     setup_lookup = setups.set_index("id", drop=False)
+    symbol_alerts = symbol_alerts[
+        symbol_alerts.apply(
+            lambda alert: is_current_approved_telegram_alert(
+                alert.to_dict(),
+                setup_for_alert(alert, setup_lookup),
+                alert_threshold=settings.alert_threshold,
+            ),
+            axis=1,
+        )
+    ]
+    if symbol_alerts.empty:
+        return None
+    symbol_alerts = symbol_alerts.sort_values("created_at", ascending=False)
     for _, alert in symbol_alerts.iterrows():
         try:
             setup_id = int(alert.get("setup_id"))
@@ -807,6 +820,79 @@ def active_alert_setup_for_symbol(
         setup["delivered"] = alert.get("delivered")
         return setup
     return None
+
+
+def setup_for_alert(alert: Union[pd.Series, dict], setup_lookup: pd.DataFrame) -> dict:
+    try:
+        setup_id = int(alert.get("setup_id"))
+    except (TypeError, ValueError):
+        return {}
+    if setup_lookup.empty or setup_id not in setup_lookup.index:
+        return {}
+    setup = setup_lookup.loc[setup_id]
+    if isinstance(setup, pd.DataFrame):
+        setup = setup.iloc[0]
+    return setup.to_dict()
+
+
+def approved_telegram_alert_rows(
+    alerts: pd.DataFrame,
+    setups: pd.DataFrame,
+    *,
+    alert_threshold: int,
+) -> pd.DataFrame:
+    if alerts.empty or setups.empty or "setup_id" not in alerts.columns or "id" not in setups.columns:
+        return pd.DataFrame(columns=alerts.columns)
+    setup_lookup = setups.set_index("id", drop=False)
+    mask = alerts.apply(
+        lambda alert: is_current_approved_telegram_alert(
+            alert.to_dict(),
+            setup_for_alert(alert, setup_lookup),
+            alert_threshold=alert_threshold,
+        ),
+        axis=1,
+    )
+    return alerts[mask].copy()
+
+
+def setup_rows_for_alerts(alerts: pd.DataFrame, fallback_setups: pd.DataFrame) -> pd.DataFrame:
+    if alerts.empty or "setup_id" not in alerts.columns:
+        return fallback_setups
+    setup_ids = sorted(
+        {
+            safe_int(value)
+            for value in alerts["setup_id"].tolist()
+            if safe_int(value) > 0
+        }
+    )
+    if not setup_ids:
+        return fallback_setups
+    placeholders = ",".join("?" for _ in setup_ids)
+    with store.connect() as conn:
+        rows = conn.execute(
+            f"select * from setups where id in ({placeholders})",
+            setup_ids,
+        ).fetchall()
+    exact_setups = pd.DataFrame([dict(row) for row in rows])
+    if exact_setups.empty:
+        return fallback_setups
+    return exact_setups
+
+
+def render_alert_cards(alerts_frame: pd.DataFrame) -> None:
+    recent_alerts = alerts_frame.sort_values("created_at", ascending=False).head(20)
+    for _, alert in recent_alerts.iterrows():
+        title = (
+            f"{alert['symbol']} {alert['direction']} | "
+            f"{alert['confidence']}/100 | {format_datetime(alert['created_at'])}"
+        )
+        with st.expander(title):
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Setup", alert["setup_type"])
+            a2.metric("Confidence", f"{alert['confidence']}/100")
+            a3.metric("Delivered", "Yes" if int(alert["delivered"]) else "No")
+            link_action(f"Open {alert['symbol']} Chart", tradingview_url(alert["symbol"]))
+            st.text(alert["message"])
 
 
 def prioritize_market_setups(symbol_setups: pd.DataFrame) -> pd.DataFrame:
@@ -1049,8 +1135,8 @@ def render_notification_diagnostics() -> None:
             f"errors {heartbeat.get('errors_count', 0)}"
         )
     st.caption(
-        f"This bot only sends trade alerts at {settings.alert_threshold}-100 confidence. "
-        "Watch-only setups stay in the dashboard."
+        "Telegram is limited to core 100/100 Liquidity Sweep Reversal alerts on 15m/30m "
+        "and Carter Squeeze puts. Watch-only and experimental setups stay in the dashboard."
     )
 
 
@@ -1705,23 +1791,39 @@ with alerts_tab:
     alerts = df("alerts", 200)
     setups = df("setups", 300)
     attempts = df("telegram_delivery_attempts", 200)
+    alert_setups = setup_rows_for_alerts(alerts, setups)
+    approved_alerts = approved_telegram_alert_rows(
+        alerts,
+        alert_setups,
+        alert_threshold=settings.alert_threshold,
+    )
+    legacy_alerts = (
+        alerts[~alerts["id"].isin(approved_alerts["id"])]
+        if not alerts.empty and not approved_alerts.empty
+        else alerts.copy()
+        if approved_alerts.empty
+        else pd.DataFrame(columns=alerts.columns)
+    )
 
-    if alerts.empty:
-        st.info("No Telegram alerts have been recorded yet.")
+    st.markdown("#### Approved Telegram Alerts")
+    st.caption(
+        "Current rule: core 100/100 Liquidity Sweep Reversal on 15m/30m, "
+        "Carter Squeeze puts, and management alerts only for approved Telegram entries."
+    )
+    if approved_alerts.empty:
+        st.info("No current-rule Telegram alerts have been recorded yet.")
     else:
-        recent_alerts = alerts.sort_values("created_at", ascending=False).head(20)
-        for _, alert in recent_alerts.iterrows():
-            title = (
-                f"{alert['symbol']} {alert['direction']} | "
-                f"{alert['confidence']}/100 | {format_datetime(alert['created_at'])}"
-            )
-            with st.expander(title):
-                a1, a2, a3 = st.columns(3)
-                a1.metric("Setup", alert["setup_type"])
-                a2.metric("Confidence", f"{alert['confidence']}/100")
-                a3.metric("Delivered", "Yes" if int(alert["delivered"]) else "No")
-                link_action(f"Open {alert['symbol']} Chart", tradingview_url(alert["symbol"]))
-                st.text(alert["message"])
+        render_alert_cards(approved_alerts)
+
+    st.markdown("#### Legacy / Excluded Telegram Attempts")
+    st.caption(
+        "Older alerts or attempts that do not meet the current Telegram rule. "
+        "Use these for audit/history, not as approved alert quality."
+    )
+    if legacy_alerts.empty:
+        st.info("No legacy or excluded Telegram attempts in the recent history.")
+    else:
+        render_alert_cards(legacy_alerts)
 
     st.subheader("Watch-Only Setups")
     if setups.empty:
@@ -1744,10 +1846,10 @@ with alerts_tab:
             show_table(attempts.sort_values("attempted_at", ascending=False), height=360)
 
     st.subheader("Alert Review")
-    if alerts.empty:
+    if approved_alerts.empty:
         st.info("No alert to review yet.")
     else:
-        alert_options = alerts.sort_values("created_at", ascending=False).copy()
+        alert_options = approved_alerts.sort_values("created_at", ascending=False).copy()
         alert_options["label"] = alert_options.apply(
             lambda row: (
                 f"#{row['id']} {row['symbol']} {row['direction']} "
@@ -2236,13 +2338,8 @@ with paper_tab:
         "Older replay/backtest rows and blocked setup families stay archived in SQLite but are not included in these headline scores."
     )
     excluded_setups = set(getattr(settings, "excluded_setup_types", []) or [])
-    live_summary = live_paper.refresh_live_100_outcomes(store, excluded_setups)
-    live_events = pd.DataFrame(
-        live_paper.list_current_live_100_paper_events(store, excluded_setups)
-    )
-    live_summary = live_paper.live_100_summary(
-        live_events.to_dict("records") if not live_events.empty else []
-    )
+    live_summary, live_event_rows = live_paper.current_live_100_snapshot(store, excluded_setups)
+    live_events = pd.DataFrame(live_event_rows)
 
     st.markdown("### Core Strict Liquidity Sweep Paper Trades")
     tracking_since = "-"
@@ -2315,11 +2412,8 @@ with paper_tab:
     st.caption(
         "Counts only Carter SHORT/put-side paper alerts. Carter call-side remains blocked or watch-only until it earns separate evidence."
     )
-    carter_summary = live_paper.refresh_live_carter_put_outcomes(store)
-    carter_events = pd.DataFrame(live_paper.list_live_carter_put_paper_events(store))
-    carter_summary = live_paper.live_100_summary(
-        carter_events.to_dict("records") if not carter_events.empty else []
-    )
+    carter_summary, carter_event_rows = live_paper.current_carter_put_snapshot(store)
+    carter_events = pd.DataFrame(carter_event_rows)
     carter_tracking_since = "-"
     if not carter_events.empty:
         carter_tracking_since = format_datetime(carter_events["event_time"].min(), include_relative=False)
@@ -2372,11 +2466,8 @@ with paper_tab:
         "Dashboard-only experimental lane. These rows are paper-tracked for evidence; "
         "Telegram is unchanged until the lane graduates."
     )
-    trap_summary = live_paper.refresh_live_failed_auction_trap_outcomes(store)
-    trap_events = pd.DataFrame(live_paper.list_live_failed_auction_trap_paper_events(store))
-    trap_summary = live_paper.live_100_summary(
-        trap_events.to_dict("records") if not trap_events.empty else []
-    )
+    trap_summary, trap_event_rows = live_paper.current_failed_auction_trap_snapshot(store)
+    trap_events = pd.DataFrame(trap_event_rows)
     trap_tracking_since = "-"
     if not trap_events.empty:
         trap_tracking_since = format_datetime(trap_events["event_time"].min(), include_relative=False)

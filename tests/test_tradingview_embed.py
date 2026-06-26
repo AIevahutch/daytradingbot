@@ -8,17 +8,18 @@ from trading_bot.tradingview import (
 )
 
 
-def test_tradingview_symbol_uses_amex_index_etfs():
+def test_tradingview_symbol_uses_symbol_specific_exchanges():
     assert tradingview_symbol("SPY") == "AMEX:SPY"
-    assert tradingview_symbol("qqq") == "AMEX:QQQ"
+    assert tradingview_symbol("qqq") == "NASDAQ:QQQ"
 
 
 def test_tradingview_url_encodes_symbol():
     assert tradingview_url("IWM").endswith("?symbol=AMEX%3AIWM")
+    assert tradingview_url("QQQ").endswith("?symbol=NASDAQ%3AQQQ")
 
 
 def test_tradingview_widget_url_points_to_direct_iframe_widget():
-    widget_url = tradingview_widget_url("SPY")
+    widget_url = tradingview_widget_url("QQQ")
     parsed = urlparse(widget_url)
 
     assert parsed.scheme == "https"
@@ -26,7 +27,7 @@ def test_tradingview_widget_url_points_to_direct_iframe_widget():
     assert parsed.path == "/embed-widget/advanced-chart/"
     assert parsed.query == "locale=en"
     decoded_config = unquote(parsed.fragment)
-    assert '"symbol":"AMEX:SPY"' in decoded_config
+    assert '"symbol":"NASDAQ:QQQ"' in decoded_config
     assert '"interval":"5"' in decoded_config
     assert '"timezone":"America/Los_Angeles"' in decoded_config
 

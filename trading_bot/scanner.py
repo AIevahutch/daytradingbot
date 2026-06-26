@@ -14,6 +14,7 @@ from trading_bot.alerts.telegram import (
     format_tactical_exit_alert,
     tactical_exit_price,
 )
+from trading_bot.alert_policy import is_core_telegram_entry_allowed
 from trading_bot.carter_squeeze import CarterSqueezeEngine
 from trading_bot.data.market_data import (
     DataUnavailable,
@@ -24,6 +25,7 @@ from trading_bot.data.market_data import (
 from trading_bot.failed_auction_trap import FailedAuctionTrapEngine
 from trading_bot.levels.levels import LevelEngine
 from trading_bot.models import Candle, SetupSignal
+from trading_bot import live_paper
 from trading_bot.psychology.no_trade import NoTradeEngine
 from trading_bot.research.agent import current_session_date
 from trading_bot.research.gating import apply_research_gate, research_gate_context
@@ -54,7 +56,6 @@ from trading_bot.storage import SQLiteStore
 from trading_bot.strategy.engine import StrategyEngine, fast_intraday_bias, trend_bias
 
 logger = logging.getLogger(__name__)
-CORE_TELEGRAM_MIN_CONFIDENCE = 95
 
 
 def _parse_session_time(value: str) -> dt_time:
@@ -306,11 +307,34 @@ class TradingScanner:
             result["alerts"].append(
                 f"Core Model {symbol}: {scored.timeframe} {scored.setup_type} {scored.confidence}/100"
             )
+        self._refresh_paper_outcomes(result)
         status = "degraded" if result["errors"] else "ok"
         self.store.insert_scan_heartbeat(
             started_at, datetime.utcnow().replace(microsecond=0), status, result
         )
         return result
+
+    def _refresh_paper_outcomes(self, result: Dict[str, List[str]]) -> None:
+        try:
+            summaries = live_paper.refresh_all_live_outcomes(
+                self.store,
+                set(getattr(self.settings, "excluded_setup_types", []) or []),
+            )
+        except Exception as exc:
+            logger.warning("Paper outcome refresh failed: %s", exc)
+            result["errors"].append("Paper outcome refresh failed")
+            return
+        updated = sum(int(summary.get("updated", 0) or 0) for summary in summaries.values())
+        locked_lanes = [
+            lane for lane, summary in summaries.items() if summary.get("error") == "database_locked"
+        ]
+        if updated:
+            result["watch_only"].append(f"Paper tracking: updated {updated} outcome(s)")
+        if locked_lanes:
+            result["no_trade"].append(
+                "Paper tracking refresh skipped while database was busy: "
+                + ", ".join(sorted(locked_lanes))
+            )
 
     def _send_carter_squeeze_alerts(
         self,
@@ -733,10 +757,7 @@ def _daily_cap_override_allowed(setup: SetupSignal) -> bool:
 
 
 def _core_telegram_alert_allowed(setup: SetupSignal) -> bool:
-    return (
-        setup.status == "alert_ready"
-        and int(setup.confidence or 0) >= CORE_TELEGRAM_MIN_CONFIDENCE
-    )
+    return is_core_telegram_entry_allowed(setup.__dict__)
 
 
 def _tactical_exit_followup_allowed(setup: SetupSignal, settings: Settings) -> bool:

@@ -6,11 +6,16 @@ from urllib.parse import quote, urlencode
 
 
 DEFAULT_EXCHANGE = "AMEX"
+SYMBOL_EXCHANGES = {
+    "QQQ": "NASDAQ",
+}
 
 
 def tradingview_symbol(symbol: str, exchange: str = DEFAULT_EXCHANGE) -> str:
     cleaned_symbol = str(symbol or "").strip().upper()
-    cleaned_exchange = str(exchange or DEFAULT_EXCHANGE).strip().upper()
+    cleaned_exchange = str(
+        SYMBOL_EXCHANGES.get(cleaned_symbol, exchange or DEFAULT_EXCHANGE)
+    ).strip().upper()
     return f"{cleaned_exchange}:{cleaned_symbol}"
 
 

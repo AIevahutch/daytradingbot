@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -22,6 +24,7 @@ from trading_bot.signal_sources import (
 from trading_bot.storage import SQLiteStore
 
 
+logger = logging.getLogger(__name__)
 CURRENT_CORE_SETUP_TYPE = "Liquidity sweep reversal"
 CURRENT_CORE_TIMEFRAMES = {"15m", "30m"}
 CARTER_PUT_DIRECTION = "SHORT"
@@ -72,6 +75,45 @@ def refresh_live_carter_put_outcomes(store: SQLiteStore) -> Dict[str, int]:
 
 def refresh_live_failed_auction_trap_outcomes(store: SQLiteStore) -> Dict[str, int]:
     return refresh_live_source_outcomes(store, list_live_failed_auction_trap_paper_events)
+
+
+def current_live_100_snapshot(
+    store: SQLiteStore,
+    excluded_setup_types: Optional[Iterable[str]] = None,
+) -> tuple[Dict[str, int], List[Dict]]:
+    events = list_current_live_100_paper_events(store, excluded_setup_types)
+    return live_100_summary(events), events
+
+
+def current_carter_put_snapshot(store: SQLiteStore) -> tuple[Dict[str, int], List[Dict]]:
+    events = list_live_carter_put_paper_events(store)
+    return live_100_summary(events), events
+
+
+def current_failed_auction_trap_snapshot(store: SQLiteStore) -> tuple[Dict[str, int], List[Dict]]:
+    events = list_live_failed_auction_trap_paper_events(store)
+    return live_100_summary(events), events
+
+
+def refresh_all_live_outcomes(
+    store: SQLiteStore,
+    excluded_setup_types: Optional[Iterable[str]] = None,
+) -> Dict[str, Dict]:
+    refreshers = {
+        "core": lambda: refresh_live_100_outcomes(store, excluded_setup_types),
+        "carter_put": lambda: refresh_live_carter_put_outcomes(store),
+        "failed_auction_trap": lambda: refresh_live_failed_auction_trap_outcomes(store),
+    }
+    results: Dict[str, Dict] = {}
+    for lane, refresh in refreshers.items():
+        try:
+            results[lane] = refresh()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            logger.warning("Paper outcome refresh skipped for %s: database is locked", lane)
+            results[lane] = {"updated": 0, "error": "database_locked"}
+    return results
 
 
 def refresh_live_source_outcomes(
