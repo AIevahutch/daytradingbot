@@ -25,6 +25,7 @@ from trading_bot.analytics.recommendations import RecommendationEngine
 from trading_bot.alert_policy import is_current_approved_telegram_alert
 from trading_bot.alerts.telegram import TelegramClient
 from trading_bot.dashboard_refresh import enable_dashboard_auto_refresh
+from trading_bot.dashboard_status import lightweight_dashboard_status
 from trading_bot.email.gmail import GmailSMTPClient
 from trading_bot.health import run_healthcheck
 from trading_bot.journal.delete import remove_trade_entry
@@ -39,8 +40,7 @@ import trading_bot.live_paper as live_paper
 from trading_bot.research.agent import ResearchAgent, current_session_date
 from trading_bot.research.calendar import PHASES, PHASE_LABELS, phase_for_datetime
 from trading_bot.runtime.scanner_process import (
-    reconcile_scanner_status,
-    recover_scanner_if_stale,
+    DEFAULT_LOG_FILE,
     run_scan_once,
     start_scanner,
     stop_scanner,
@@ -645,36 +645,6 @@ def render_check_card(check: dict) -> None:
         </div>
         """,
         unsafe_allow_html=True,
-    )
-
-
-def health_checks_by_name(health: dict) -> dict:
-    return {check.get("name"): check for check in health.get("checks", [])}
-
-
-def auto_recover_scanner_if_needed(health: dict, heartbeat: Optional[dict]):
-    checks = health_checks_by_name(health)
-    data_check = checks.get("data_freshness", {})
-    scanner_check = checks.get("scanner_heartbeat", {})
-    data_detail = str(data_check.get("detail") or "").lower()
-    scanner_detail = str(scanner_check.get("detail") or "").lower()
-    market_expected = "market data expected" in data_detail or "during configured" in scanner_detail
-    scanner_problem = scanner_check.get("status") == "warn" and any(
-        phrase in scanner_detail
-        for phrase in ("not running", "stopped", "stale")
-    )
-    if not market_expected or not scanner_problem:
-        return None
-
-    last_attempt = parse_datetime(st.session_state.get("scanner_auto_recovery_at"))
-    now = datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
-    if last_attempt and (now - last_attempt).total_seconds() < 600:
-        return None
-
-    st.session_state["scanner_auto_recovery_at"] = datetime.utcnow().replace(microsecond=0).isoformat()
-    return recover_scanner_if_stale(
-        heartbeat["completed_at"] if heartbeat else None,
-        max(settings.scan_cadence_seconds * 3, 300),
     )
 
 
@@ -1577,22 +1547,11 @@ def render_research_tab() -> None:
                 st.info("No raw evidence recorded.")
 
 
-health_preview = run_healthcheck(settings, store)
-heartbeat_preview = store.latest_scan_heartbeat()
 scanner_stale_after_seconds = max(settings.scan_cadence_seconds * 10, 1800)
-scanner_recovery_status = auto_recover_scanner_if_needed(health_preview, heartbeat_preview)
-if scanner_recovery_status:
-    heartbeat_preview = store.latest_scan_heartbeat()
-    health_preview = run_healthcheck(settings, store)
-process_preview = reconcile_scanner_status(
-    heartbeat_preview["completed_at"] if heartbeat_preview else None,
-    scanner_stale_after_seconds,
-)
+runtime_preview = lightweight_dashboard_status(settings, store)
 
 inject_styles()
-render_intro(health_preview["status"], process_preview.running)
-if scanner_recovery_status:
-    st.info(f"Scanner recovery: {scanner_recovery_status.message}")
+render_intro(runtime_preview.status, runtime_preview.scanner_running)
 
 (
     health_tab,
@@ -1620,11 +1579,6 @@ if scanner_recovery_status:
 
 with health_tab:
     st.subheader("Scanner Controls")
-    heartbeat = store.latest_scan_heartbeat()
-    process_status = reconcile_scanner_status(
-        heartbeat["completed_at"] if heartbeat else None,
-        scanner_stale_after_seconds,
-    )
     control_message = None
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1654,18 +1608,19 @@ with health_tab:
         else:
             control_message = ("warning", f"Telegram test failed: {error}")
 
-    heartbeat = store.latest_scan_heartbeat()
-    process_status = reconcile_scanner_status(
-        heartbeat["completed_at"] if heartbeat else None,
-        scanner_stale_after_seconds,
-    )
+    runtime_status = lightweight_dashboard_status(settings, store)
     pcols = st.columns(5)
-    pcols[0].metric("Scanner", "Running" if process_status.running else "Stopped")
-    pcols[1].metric("PID", process_status.pid or "-")
-    pcols[2].metric("Last Scan", format_datetime(heartbeat["completed_at"]) if heartbeat else "-")
+    pcols[0].metric("Scanner", "Running" if runtime_status.scanner_running else "Stopped")
+    pcols[1].metric("PID", runtime_status.scanner_pid or "-")
+    pcols[2].metric(
+        "Last Scan",
+        format_datetime(runtime_status.latest_heartbeat_completed_at)
+        if runtime_status.latest_heartbeat_completed_at
+        else "-",
+    )
     pcols[3].metric("Cadence", format_cadence(int(settings.scan_cadence_seconds)))
     pcols[4].metric("Alert Frames", ", ".join(settings.alert_timeframes))
-    st.caption(f"Process log: {process_status.log_file}")
+    st.caption(f"Process log: {DEFAULT_LOG_FILE}")
 
     if control_message:
         level, message = control_message
@@ -1675,15 +1630,22 @@ with health_tab:
             st.warning(message)
 
     st.subheader("Runtime Health")
-    health = run_healthcheck(settings, store)
-    hcols = st.columns(4)
-    hcols[0].metric("System", health["status"].upper())
-    hcols[1].metric("Checked", format_datetime(health["checked_at"]))
-    hcols[2].metric("Database", Path(health["database"]).name)
-    hcols[3].metric("Dashboard Refreshed", format_datetime(datetime.now(timezone.utc)))
+    if st.button("Run Full Healthcheck", use_container_width=True, key="health_run_full_check"):
+        with st.spinner("Running full healthcheck..."):
+            st.session_state["full_healthcheck_result"] = run_healthcheck(settings, store)
 
-    for check in health["checks"]:
-        render_check_card(check)
+    health = st.session_state.get("full_healthcheck_result")
+    if health:
+        hcols = st.columns(4)
+        hcols[0].metric("System", health["status"].upper())
+        hcols[1].metric("Checked", format_datetime(health["checked_at"]))
+        hcols[2].metric("Database", Path(health["database"]).name)
+        hcols[3].metric("Dashboard Refreshed", format_datetime(datetime.now(timezone.utc)))
+
+        for check in health["checks"]:
+            render_check_card(check)
+    else:
+        st.info("Full healthcheck is on demand so the dashboard can open quickly.")
 
     render_notification_diagnostics()
 
