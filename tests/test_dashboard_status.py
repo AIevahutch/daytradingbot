@@ -78,3 +78,11 @@ def test_dashboard_analytics_sections_use_fast_dashboard_reads():
 
     assert "store.list_trades()" not in source
     assert "store.list_alerts()" not in source
+
+
+def test_dashboard_market_uses_batched_fast_reads():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+
+    assert "dashboard_frames(" in source
+    assert "latest_symbol_candles(" in source
+    assert "lightweight_dashboard_status(settings, store)" not in source

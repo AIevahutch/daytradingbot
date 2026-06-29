@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from trading_bot.dashboard_db import latest_dashboard_candle, list_dashboard_rows
+from trading_bot.dashboard_db import (
+    latest_dashboard_candle,
+    latest_dashboard_candles,
+    list_dashboard_rows,
+    list_dashboard_tables,
+)
 from trading_bot.storage import SQLiteStore
 
 
@@ -29,6 +34,8 @@ def create_dashboard_fixture(database_path: Path) -> None:
             insert into setups (created_at, symbol) values ('2026-06-29T13:30:00', 'SPY');
             insert into candles (symbol, timeframe, timestamp, close, volume)
             values ('QQQ', '1m', '2026-06-29T13:30:00', 540.25, 12345);
+            insert into candles (symbol, timeframe, timestamp, close, volume)
+            values ('SPY', '1m', '2026-06-29T13:31:00', 737.17, 45678);
             """
         )
 
@@ -70,6 +77,27 @@ def test_dashboard_reads_timeout_quickly_when_database_is_locked(tmp_path):
         blocker.close()
 
     assert elapsed < 1.0
+
+
+def test_dashboard_can_batch_table_reads_through_one_readonly_connection(tmp_path):
+    database_path = tmp_path / "bot.db"
+    create_dashboard_fixture(database_path)
+
+    rows = list_dashboard_tables(database_path, {"setups": 5, "candles": 5})
+
+    assert rows["setups"][0]["symbol"] == "SPY"
+    assert {row["symbol"] for row in rows["candles"]} == {"QQQ", "SPY"}
+
+
+def test_dashboard_can_batch_latest_candles(tmp_path):
+    database_path = tmp_path / "bot.db"
+    create_dashboard_fixture(database_path)
+
+    candles = latest_dashboard_candles(database_path, ["SPY", "QQQ", "IWM"])
+
+    assert candles["SPY"]["close"] == 737.17
+    assert candles["QQQ"]["close"] == 540.25
+    assert candles["IWM"] is None
 
 
 def test_dashboard_store_can_skip_schema_initialization(tmp_path):

@@ -13,7 +13,6 @@ from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,8 +26,10 @@ from trading_bot.alerts.telegram import TelegramClient
 from trading_bot.dashboard_refresh import enable_dashboard_auto_refresh
 from trading_bot.dashboard_db import (
     latest_dashboard_candle,
+    latest_dashboard_candles,
     latest_dashboard_scan_heartbeat,
     list_dashboard_rows,
+    list_dashboard_tables,
 )
 from trading_bot.dashboard_navigation import (
     DASHBOARD_VIEW_QUERY_PARAM,
@@ -72,6 +73,7 @@ st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 
 AUTO_REFRESH_SECONDS = 60
+DASHBOARD_CACHE_TTL_SECONDS = 5
 DASHBOARD_DB_TIMEOUT_SECONDS = 0.25
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
@@ -351,11 +353,11 @@ def inject_styles() -> None:
 
 def rows(table: str, limit: int = 500):
     try:
-        return list_dashboard_rows(
-            settings.database_file,
+        return cached_dashboard_rows(
+            str(settings.database_file),
             table,
-            limit=limit,
-            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+            int(limit),
+            dashboard_database_signature(),
         )
     except ValueError:
         if table in OPTIONAL_DASHBOARD_TABLES:
@@ -373,6 +375,100 @@ def rows(table: str, limit: int = 500):
 def df(table: str, limit: int = 500):
     data = rows(table, limit)
     return pd.DataFrame(data) if data else pd.DataFrame()
+
+
+def dashboard_database_signature() -> tuple[int, int]:
+    try:
+        stat = Path(settings.database_file).stat()
+    except OSError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+@st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_dashboard_rows(
+    database_path: str,
+    table: str,
+    limit: int,
+    database_signature: tuple[int, int],
+) -> list[dict]:
+    return list_dashboard_rows(
+        Path(database_path),
+        table,
+        limit=limit,
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+    )
+
+
+@st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_dashboard_tables(
+    database_path: str,
+    table_limits: tuple[tuple[str, int], ...],
+    database_signature: tuple[int, int],
+) -> dict[str, list[dict]]:
+    return list_dashboard_tables(
+        Path(database_path),
+        dict(table_limits),
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+    )
+
+
+@st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_latest_dashboard_heartbeat(
+    database_path: str,
+    database_signature: tuple[int, int],
+) -> Optional[dict]:
+    return latest_dashboard_scan_heartbeat(
+        Path(database_path),
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+    )
+
+
+@st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_latest_dashboard_candle(
+    database_path: str,
+    symbol: str,
+    timeframe: str,
+    database_signature: tuple[int, int],
+) -> Optional[dict]:
+    return latest_dashboard_candle(
+        Path(database_path),
+        symbol,
+        timeframe,
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+    )
+
+
+@st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_latest_dashboard_candles(
+    database_path: str,
+    symbols: tuple[str, ...],
+    timeframe: str,
+    database_signature: tuple[int, int],
+) -> dict[str, Optional[dict]]:
+    return latest_dashboard_candles(
+        Path(database_path),
+        symbols,
+        timeframe,
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+    )
+
+
+def dashboard_frames(table_limits: dict[str, int]) -> dict[str, pd.DataFrame]:
+    try:
+        data = cached_dashboard_tables(
+            str(settings.database_file),
+            tuple(table_limits.items()),
+            dashboard_database_signature(),
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Dashboard batch read failed: %s", exc)
+        st.warning("Some dashboard data is temporarily unavailable; showing what can load now.")
+        data = {}
+    return {
+        table: pd.DataFrame(data.get(table) or [])
+        for table in table_limits
+    }
 
 
 def parse_datetime(value):
@@ -668,12 +764,18 @@ def render_check_card(check: dict) -> None:
     )
 
 
-def render_setup_summary(row: Union[pd.Series, dict], *, compact: bool = False) -> None:
+def render_setup_summary(
+    row: Union[pd.Series, dict],
+    *,
+    compact: bool = False,
+    candle: Optional[dict] = None,
+) -> None:
     value = int(row.get("confidence", 0) or 0)
     status = confidence_status(value)
     source_label = setup_source_label(row)
     symbol = safe_text(row.get("symbol"))
-    candle = latest_symbol_candle(symbol) if symbol else None
+    if candle is None and symbol:
+        candle = latest_symbol_candle(symbol)
     market_status = "warn"
     if candle:
         candle_dt = parse_datetime(candle.get("timestamp"))
@@ -941,9 +1043,9 @@ def heartbeat_no_trade_overrides_setup(
 
 def safe_latest_scan_heartbeat() -> Optional[dict]:
     try:
-        return latest_dashboard_scan_heartbeat(
-            settings.database_file,
-            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+        return cached_latest_dashboard_heartbeat(
+            str(settings.database_file),
+            dashboard_database_signature(),
         )
     except (OSError, sqlite3.Error) as exc:
         logger.warning("Dashboard heartbeat read failed: %s", exc)
@@ -952,19 +1054,45 @@ def safe_latest_scan_heartbeat() -> Optional[dict]:
 
 def latest_symbol_candle(symbol: str, timeframe: str = "1m") -> Optional[dict]:
     try:
-        return latest_dashboard_candle(
-            settings.database_file,
+        return cached_latest_dashboard_candle(
+            str(settings.database_file),
             symbol,
             timeframe,
-            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+            dashboard_database_signature(),
         )
     except (OSError, sqlite3.Error) as exc:
         logger.warning("Dashboard candle read failed for %s %s: %s", symbol, timeframe, exc)
         return None
 
 
-def render_no_trade_card(symbol: str, note: str) -> None:
-    candle = latest_symbol_candle(symbol)
+def latest_symbol_candles(symbols: list[str], timeframe: str = "1m") -> dict[str, Optional[dict]]:
+    try:
+        return cached_latest_dashboard_candles(
+            str(settings.database_file),
+            tuple(symbols),
+            timeframe,
+            dashboard_database_signature(),
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Dashboard candle batch read failed for %s: %s", timeframe, exc)
+        return {symbol: None for symbol in symbols}
+
+
+class DashboardHeartbeatStore:
+    def latest_scan_heartbeat(self) -> Optional[dict]:
+        return safe_latest_scan_heartbeat()
+
+
+def dashboard_runtime_status():
+    return lightweight_dashboard_status(settings, DashboardHeartbeatStore())
+
+
+def render_no_trade_card(
+    symbol: str,
+    note: str,
+    candle: Optional[dict] = None,
+) -> None:
+    candle = candle if candle is not None else latest_symbol_candle(symbol)
     market_label = "Market data unavailable"
     market_status = "warn"
     if candle:
@@ -1577,7 +1705,7 @@ def render_research_tab() -> None:
 
 
 scanner_stale_after_seconds = max(settings.scan_cadence_seconds * 10, 1800)
-runtime_preview = lightweight_dashboard_status(settings, store)
+runtime_preview = dashboard_runtime_status()
 
 inject_styles()
 render_intro(runtime_preview.status, runtime_preview.scanner_running)
@@ -1643,7 +1771,7 @@ if selected_view == "Health":
         else:
             control_message = ("warning", f"Telegram test failed: {error}")
 
-    runtime_status = lightweight_dashboard_status(settings, store)
+    runtime_status = dashboard_runtime_status()
     pcols = st.columns(5)
     pcols[0].metric("Scanner", "Running" if runtime_status.scanner_running else "Stopped")
     pcols[1].metric("PID", runtime_status.scanner_pid or "-")
@@ -1708,11 +1836,20 @@ if selected_view == "Research":
 
 if selected_view == "Market":
     st.subheader("Market Monitor")
-    latest_setups = df("setups", 300)
-    latest_alerts = df("alerts", 200)
-    latest_levels = df("levels", 240)
-    latest_reviews = df("daily_market_reviews", 30)
+    market_data = dashboard_frames(
+        {
+            "setups": 300,
+            "alerts": 200,
+            "levels": 240,
+            "daily_market_reviews": 30,
+        }
+    )
+    latest_setups = market_data["setups"]
+    latest_alerts = market_data["alerts"]
+    latest_levels = market_data["levels"]
+    latest_reviews = market_data["daily_market_reviews"]
     latest_heartbeat = safe_latest_scan_heartbeat()
+    latest_candles = latest_symbol_candles(list(settings.symbols))
 
     chart_cols = st.columns(len(settings.symbols))
     for index, symbol in enumerate(settings.symbols):
@@ -1747,23 +1884,28 @@ if selected_view == "Market":
         )
         with cols[idx]:
             st.markdown(f"### {symbol}")
+            symbol_candle = latest_candles.get(symbol)
             setup_view, alert_view, levels_view = st.tabs(["Current Setup", "Active Alert", "Levels"])
             with setup_view:
                 if latest_context is not None:
-                    render_setup_summary(latest_context, compact=True)
+                    render_setup_summary(latest_context, compact=True, candle=symbol_candle)
                     with st.expander("Current Setup Details"):
-                        render_setup_summary(latest_context)
+                        render_setup_summary(latest_context, candle=symbol_candle)
                         link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
                 else:
-                    render_no_trade_card(symbol, latest_symbol_scan_note(latest_heartbeat, symbol))
+                    render_no_trade_card(
+                        symbol,
+                        latest_symbol_scan_note(latest_heartbeat, symbol),
+                        symbol_candle,
+                    )
             with alert_view:
                 if active_alert_setup is not None:
                     st.caption(
                         f"Active Telegram alert from {format_datetime(active_alert_setup.get('alert_created_at'))}"
                     )
-                    render_setup_summary(active_alert_setup, compact=True)
+                    render_setup_summary(active_alert_setup, compact=True, candle=symbol_candle)
                     with st.expander("Active Alert Details"):
-                        render_setup_summary(active_alert_setup)
+                        render_setup_summary(active_alert_setup, candle=symbol_candle)
                         link_action(f"Open {symbol} on TradingView", tradingview_url(symbol))
                 else:
                     st.info("No active Telegram alert for this symbol.")
@@ -2287,6 +2429,8 @@ if selected_view == "Performance":
 
     equity = pd.DataFrame(metrics["equity_curve"])
     if not equity.empty:
+        import plotly.express as px
+
         equity["opened_at_dt"] = equity["opened_at"].apply(parse_datetime)
         fig = px.line(equity, x="opened_at_dt", y="equity", title="Equity Curve")
         fig.update_layout(
@@ -2578,12 +2722,19 @@ if selected_view == "Paper":
         show_table(experiment_setups, height=320)
 
     with st.expander("Latest Scanner Watch-Only Notes", expanded=False):
-        watch_notes = latest_watch_only_notes(df("scanner_heartbeats", 5))
-        if not watch_notes:
-            st.info("No watch-only notes in the latest scanner heartbeat.")
+        load_watch_notes = st.checkbox(
+            "Load latest watch-only scanner notes",
+            key="paper_load_watch_notes",
+        )
+        if load_watch_notes:
+            watch_notes = latest_watch_only_notes(df("scanner_heartbeats", 5))
+            if not watch_notes:
+                st.info("No watch-only notes in the latest scanner heartbeat.")
+            else:
+                for note in watch_notes:
+                    st.write(note)
         else:
-            for note in watch_notes:
-                st.write(note)
+            st.caption("Skipped until requested so the Paper page can render faster.")
     st.divider()
 
     with st.expander("Archived replay/backtest data", expanded=False):
@@ -2591,25 +2742,32 @@ if selected_view == "Paper":
             "These are older strategy-version rows kept for audit only. "
             "They are intentionally excluded from the current live paper stats above."
         )
-        runs = df("paper_runs", 100)
-        events = df("paper_events", 500)
-        live_sources = {
-            LIVE_CORE_100_PAPER_SOURCE,
-            LIVE_CARTER_PAPER_SOURCE,
-            LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
-        }
-        replay_runs = runs[~runs["source"].isin(live_sources)] if not runs.empty else runs
-        if replay_runs.empty:
-            st.info("No archived replay runs found.")
+        load_archive = st.checkbox(
+            "Load archived replay/backtest rows",
+            key="paper_load_archived_replay",
+        )
+        if load_archive:
+            runs = df("paper_runs", 100)
+            events = df("paper_events", 500)
+            live_sources = {
+                LIVE_CORE_100_PAPER_SOURCE,
+                LIVE_CARTER_PAPER_SOURCE,
+                LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
+            }
+            replay_runs = runs[~runs["source"].isin(live_sources)] if not runs.empty else runs
+            if replay_runs.empty:
+                st.info("No archived replay runs found.")
+            else:
+                show_table(replay_runs, height=220)
+            if not events.empty and not runs.empty:
+                replay_ids = set(replay_runs["id"].tolist()) if not replay_runs.empty else set()
+                replay_events = events[events["run_id"].isin(replay_ids)]
+                if not replay_events.empty:
+                    readable_events = replay_events.copy()
+                    readable_events["source_label"] = readable_events.apply(paper_source_label, axis=1)
+                    show_table(readable_events.sort_values("event_time", ascending=False), height=320)
         else:
-            show_table(replay_runs, height=220)
-        if not events.empty and not runs.empty:
-            replay_ids = set(replay_runs["id"].tolist()) if not replay_runs.empty else set()
-            replay_events = events[events["run_id"].isin(replay_ids)]
-            if not replay_events.empty:
-                readable_events = replay_events.copy()
-                readable_events["source_label"] = readable_events.apply(paper_source_label, axis=1)
-                show_table(readable_events.sort_values("event_time", ascending=False), height=320)
+            st.caption("Skipped until requested so current-rule paper metrics stay fast.")
 
 if selected_view == "Improve":
     st.subheader("Improvement Lab")
