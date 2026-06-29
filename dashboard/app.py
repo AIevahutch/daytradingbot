@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -29,6 +30,10 @@ from trading_bot.dashboard_db import (
     latest_dashboard_candle,
     latest_dashboard_scan_heartbeat,
     list_dashboard_rows,
+)
+from trading_bot.dashboard_navigation import (
+    DASHBOARD_VIEW_QUERY_PARAM,
+    normalize_dashboard_view,
 )
 from trading_bot.dashboard_status import lightweight_dashboard_status
 from trading_bot.email.gmail import GmailSMTPClient
@@ -68,6 +73,7 @@ st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 AUTO_REFRESH_SECONDS = 60
 DASHBOARD_DB_TIMEOUT_SECONDS = 0.25
+DASHBOARD_NAVIGATION_PAUSE_KEY = "dashboard_last_navigation_at"
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
@@ -83,10 +89,20 @@ EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 
 def enable_auto_refresh(interval_seconds: int = AUTO_REFRESH_SECONDS) -> None:
-    enable_dashboard_auto_refresh(interval_seconds)
+    enable_dashboard_auto_refresh(
+        interval_seconds,
+        pause_state_key=DASHBOARD_NAVIGATION_PAUSE_KEY,
+    )
 
 
-enable_auto_refresh()
+def remember_dashboard_view() -> None:
+    selected = normalize_dashboard_view(
+        st.session_state.get("dashboard_view"),
+        DASHBOARD_VIEWS,
+        "Market",
+    )
+    st.session_state[DASHBOARD_NAVIGATION_PAUSE_KEY] = time.monotonic()
+    st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = selected
 
 
 @st.cache_resource
@@ -1591,14 +1607,32 @@ DASHBOARD_VIEWS = [
     "Paper",
     "Improve",
 ]
+requested_view_param = st.query_params.get(DASHBOARD_VIEW_QUERY_PARAM)
+requested_view = normalize_dashboard_view(
+    requested_view_param,
+    DASHBOARD_VIEWS,
+    "Market",
+)
+if (
+    st.session_state.get("dashboard_view") not in DASHBOARD_VIEWS
+    or (
+        requested_view_param
+        and requested_view != st.session_state.get("dashboard_view")
+    )
+):
+    st.session_state["dashboard_view"] = requested_view
 selected_view = st.radio(
     "Dashboard section",
     DASHBOARD_VIEWS,
-    index=DASHBOARD_VIEWS.index("Market"),
+    index=DASHBOARD_VIEWS.index(st.session_state["dashboard_view"]),
     horizontal=True,
     label_visibility="collapsed",
     key="dashboard_view",
+    on_change=remember_dashboard_view,
 )
+if st.query_params.get(DASHBOARD_VIEW_QUERY_PARAM) != selected_view:
+    st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = selected_view
+enable_auto_refresh()
 
 if selected_view == "Health":
     st.subheader("Scanner Controls")
