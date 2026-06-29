@@ -61,3 +61,11 @@ def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
     assert "st.tabs(" not in top_level_section
     assert 'if selected_view == "Market":' in source
     assert navigation_index < source.index('if selected_view == "Health":')
+
+
+def test_dashboard_startup_avoids_module_reloads_and_schema_initialization():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+
+    assert "importlib.reload(" not in source
+    assert "initialize=False" in source
+    assert "list_dashboard_rows(" in source

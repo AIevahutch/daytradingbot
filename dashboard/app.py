@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
+import sqlite3
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -25,6 +25,11 @@ from trading_bot.analytics.recommendations import RecommendationEngine
 from trading_bot.alert_policy import is_current_approved_telegram_alert
 from trading_bot.alerts.telegram import TelegramClient
 from trading_bot.dashboard_refresh import enable_dashboard_auto_refresh
+from trading_bot.dashboard_db import (
+    latest_dashboard_candle,
+    latest_dashboard_scan_heartbeat,
+    list_dashboard_rows,
+)
 from trading_bot.dashboard_status import lightweight_dashboard_status
 from trading_bot.email.gmail import GmailSMTPClient
 from trading_bot.health import run_healthcheck
@@ -52,19 +57,17 @@ from trading_bot.signal_sources import (
     LIVE_FAILED_AUCTION_TRAP_PAPER_SOURCE,
     LIVE_CORE_100_PAPER_SOURCE,
 )
-import trading_bot.storage as storage_module
 from trading_bot.storage import SQLiteStore
 from trading_bot.tradingview import tradingview_url
 
 
 logger = logging.getLogger(__name__)
-live_paper = importlib.reload(live_paper)
-storage_module = importlib.reload(storage_module)
 
 st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 
 AUTO_REFRESH_SECONDS = 60
+DASHBOARD_DB_TIMEOUT_SECONDS = 0.25
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
@@ -89,7 +92,11 @@ enable_auto_refresh()
 @st.cache_resource
 def get_store(config_mtime: float):
     settings = load_settings()
-    return settings, SQLiteStore(settings.database_file)
+    return settings, SQLiteStore(
+        settings.database_file,
+        timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+        initialize=False,
+    )
 
 
 CONFIG_FILE = PROJECT_ROOT / "config" / "settings.yaml"
@@ -342,12 +349,23 @@ def inject_styles() -> None:
 
 def rows(table: str, limit: int = 500):
     try:
-        return store.list_rows(table, limit=limit)
+        return list_dashboard_rows(
+            settings.database_file,
+            table,
+            limit=limit,
+            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+        )
     except ValueError:
         if table in OPTIONAL_DASHBOARD_TABLES:
             logger.warning("Optional dashboard table is unavailable: %s", table)
             return []
         raise
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Dashboard read failed for %s: %s", table, exc)
+        if table in OPTIONAL_DASHBOARD_TABLES:
+            return []
+        st.warning(f"{table} is temporarily unavailable; showing the rest of the dashboard.")
+        return []
 
 
 def df(table: str, limit: int = 500):
@@ -459,7 +477,7 @@ def paper_summary_compat(store_obj, run_id=None, signal_source=None):
     try:
         return store_obj.paper_summary(run_id, signal_source=signal_source)
     except TypeError:
-        return storage_module.SQLiteStore.paper_summary(
+        return SQLiteStore.paper_summary(
             store_obj,
             run_id=run_id,
             signal_source=signal_source,
@@ -919,19 +937,28 @@ def heartbeat_no_trade_overrides_setup(
     return bool(heartbeat_time and setup_time and heartbeat_time > setup_time)
 
 
+def safe_latest_scan_heartbeat() -> Optional[dict]:
+    try:
+        return latest_dashboard_scan_heartbeat(
+            settings.database_file,
+            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Dashboard heartbeat read failed: %s", exc)
+        return None
+
+
 def latest_symbol_candle(symbol: str, timeframe: str = "1m") -> Optional[dict]:
-    with store.connect() as conn:
-        row = conn.execute(
-            """
-            select timestamp, close, volume
-            from candles
-            where symbol = ? and timeframe = ?
-            order by timestamp desc
-            limit 1
-            """,
-            (symbol, timeframe),
-        ).fetchone()
-    return dict(row) if row else None
+    try:
+        return latest_dashboard_candle(
+            settings.database_file,
+            symbol,
+            timeframe,
+            timeout_seconds=DASHBOARD_DB_TIMEOUT_SECONDS,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Dashboard candle read failed for %s %s: %s", symbol, timeframe, exc)
+        return None
 
 
 def render_no_trade_card(symbol: str, note: str) -> None:
@@ -1673,7 +1700,7 @@ if selected_view == "Market":
     latest_alerts = df("alerts", 200)
     latest_levels = df("levels", 240)
     latest_reviews = df("daily_market_reviews", 30)
-    latest_heartbeat = store.latest_scan_heartbeat()
+    latest_heartbeat = safe_latest_scan_heartbeat()
 
     chart_cols = st.columns(len(settings.symbols))
     for index, symbol in enumerate(settings.symbols):

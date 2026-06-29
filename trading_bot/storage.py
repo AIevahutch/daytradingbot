@@ -160,14 +160,22 @@ def _paper_group_metrics(rows: List[Dict]) -> Dict:
 
 
 class SQLiteStore:
-    def __init__(self, database_path: Path):
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        timeout_seconds: float = 30.0,
+        initialize: bool = True,
+    ):
         self.database_path = Path(database_path)
+        self.timeout_seconds = timeout_seconds
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.initialize()
+        if initialize:
+            self.initialize()
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(str(self.database_path))
+        conn = sqlite3.connect(str(self.database_path), timeout=self.timeout_seconds)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
