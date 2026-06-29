@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import sqlite3
-import time
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -33,6 +32,7 @@ from trading_bot.dashboard_db import (
 )
 from trading_bot.dashboard_navigation import (
     DASHBOARD_VIEW_QUERY_PARAM,
+    dashboard_view_href,
     normalize_dashboard_view,
 )
 from trading_bot.dashboard_status import lightweight_dashboard_status
@@ -73,7 +73,6 @@ st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 
 AUTO_REFRESH_SECONDS = 60
 DASHBOARD_DB_TIMEOUT_SECONDS = 0.25
-DASHBOARD_NAVIGATION_PAUSE_KEY = "dashboard_last_navigation_at"
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
@@ -89,20 +88,7 @@ EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 
 def enable_auto_refresh(interval_seconds: int = AUTO_REFRESH_SECONDS) -> None:
-    enable_dashboard_auto_refresh(
-        interval_seconds,
-        pause_state_key=DASHBOARD_NAVIGATION_PAUSE_KEY,
-    )
-
-
-def remember_dashboard_view() -> None:
-    selected = normalize_dashboard_view(
-        st.session_state.get("dashboard_view"),
-        DASHBOARD_VIEWS,
-        "Market",
-    )
-    st.session_state[DASHBOARD_NAVIGATION_PAUSE_KEY] = time.monotonic()
-    st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = selected
+    enable_dashboard_auto_refresh(interval_seconds)
 
 
 @st.cache_resource
@@ -1608,30 +1594,22 @@ DASHBOARD_VIEWS = [
     "Improve",
 ]
 requested_view_param = st.query_params.get(DASHBOARD_VIEW_QUERY_PARAM)
-requested_view = normalize_dashboard_view(
+selected_view = normalize_dashboard_view(
     requested_view_param,
     DASHBOARD_VIEWS,
     "Market",
 )
-if (
-    st.session_state.get("dashboard_view") not in DASHBOARD_VIEWS
-    or (
-        requested_view_param
-        and requested_view != st.session_state.get("dashboard_view")
-    )
-):
-    st.session_state["dashboard_view"] = requested_view
-selected_view = st.radio(
-    "Dashboard section",
-    DASHBOARD_VIEWS,
-    index=DASHBOARD_VIEWS.index(st.session_state["dashboard_view"]),
-    horizontal=True,
-    label_visibility="collapsed",
-    key="dashboard_view",
-    on_change=remember_dashboard_view,
-)
-if st.query_params.get(DASHBOARD_VIEW_QUERY_PARAM) != selected_view:
+if requested_view_param != selected_view:
     st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = selected_view
+nav_cols = st.columns(len(DASHBOARD_VIEWS))
+current_query_params = dict(st.query_params)
+for nav_col, view in zip(nav_cols, DASHBOARD_VIEWS):
+    nav_col.link_button(
+        view,
+        dashboard_view_href(view, current_params=current_query_params),
+        type="primary" if view == selected_view else "secondary",
+        use_container_width=True,
+    )
 enable_auto_refresh()
 
 if selected_view == "Health":
@@ -2298,7 +2276,7 @@ if selected_view == "Journal":
 
 if selected_view == "Performance":
     st.subheader("Performance")
-    trades = store.list_trades()
+    trades = df("trades", 500).to_dict("records")
     metrics = calculate_metrics(trades)
     mcols = st.columns(5)
     mcols[0].metric("Total P/L", f"${metrics['total_pl']:,.2f}")
@@ -2335,7 +2313,7 @@ if selected_view == "Performance":
 
 if selected_view == "Breakdowns":
     st.subheader("Breakdown Analytics")
-    trades = store.list_trades()
+    trades = df("trades", 500).to_dict("records")
     data = breakdowns(trades)
     for name, metrics_by_group in data.items():
         st.write(name.replace("_", " ").title())
@@ -2637,7 +2615,10 @@ if selected_view == "Improve":
     st.subheader("Improvement Lab")
     st.caption("Recommendations are analysis only. They never change live rules unless you review and approve them.")
     engine = RecommendationEngine()
-    recommendations = engine.generate(store.list_trades(), store.list_alerts())
+    recommendations = engine.generate(
+        df("trades", 500).to_dict("records"),
+        df("alerts", 500).to_dict("records"),
+    )
     if recommendations:
         for rec in recommendations:
             with st.container(border=True):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import urlencode
 
 
 DASHBOARD_VIEW_QUERY_PARAM = "view"
@@ -29,3 +30,13 @@ def dashboard_view_index(
     return list(allowed_views).index(
         normalize_dashboard_view(raw_value, allowed_views, default_view)
     )
+
+
+def dashboard_view_href(
+    view: str,
+    *,
+    current_params: dict[str, Any] | None = None,
+) -> str:
+    params = dict(current_params or {})
+    params[DASHBOARD_VIEW_QUERY_PARAM] = view
+    return f"?{urlencode(params, doseq=True)}"

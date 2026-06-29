@@ -45,7 +45,7 @@ def test_lightweight_dashboard_status_handles_busy_database(tmp_path):
 
 def test_dashboard_does_not_run_full_healthcheck_during_global_render():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    navigation_index = source.index("selected_view = st.radio(")
+    navigation_index = source.index("nav_cols = st.columns(")
     before_navigation = source[:navigation_index]
 
     assert "run_healthcheck(" not in before_navigation
@@ -55,10 +55,12 @@ def test_dashboard_does_not_run_full_healthcheck_during_global_render():
 
 def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    navigation_index = source.index("selected_view = st.radio(")
+    navigation_index = source.index("nav_cols = st.columns(")
     top_level_section = source[: source.index('if selected_view == "Health":')]
 
     assert "st.tabs(" not in top_level_section
+    assert "st.radio(" not in top_level_section
+    assert "link_button(" in top_level_section
     assert 'if selected_view == "Market":' in source
     assert navigation_index < source.index('if selected_view == "Health":')
 
@@ -69,3 +71,10 @@ def test_dashboard_startup_avoids_module_reloads_and_schema_initialization():
     assert "importlib.reload(" not in source
     assert "initialize=False" in source
     assert "list_dashboard_rows(" in source
+
+
+def test_dashboard_analytics_sections_use_fast_dashboard_reads():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+
+    assert "store.list_trades()" not in source
+    assert "store.list_alerts()" not in source

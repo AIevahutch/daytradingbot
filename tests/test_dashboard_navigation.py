@@ -1,6 +1,10 @@
 import pytest
 
-from trading_bot.dashboard_navigation import dashboard_view_index, normalize_dashboard_view
+from trading_bot.dashboard_navigation import (
+    dashboard_view_href,
+    dashboard_view_index,
+    normalize_dashboard_view,
+)
 
 
 VIEWS = ["Health", "Research", "Market", "Alerts"]
@@ -31,3 +35,17 @@ def test_dashboard_view_index_matches_normalized_view():
 def test_dashboard_view_index_requires_views():
     with pytest.raises(ValueError):
         dashboard_view_index("Market", [], "Market")
+
+
+def test_dashboard_view_href_preserves_existing_params_and_sets_view():
+    assert (
+        dashboard_view_href(
+            "Paper",
+            current_params={"fresh": "tab-fix-final", "view": "Market"},
+        )
+        == "?fresh=tab-fix-final&view=Paper"
+    )
+
+
+def test_dashboard_view_href_encodes_view_names():
+    assert dashboard_view_href("Paper Trading") == "?view=Paper+Trading"
