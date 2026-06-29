@@ -45,9 +45,19 @@ def test_lightweight_dashboard_status_handles_busy_database(tmp_path):
 
 def test_dashboard_does_not_run_full_healthcheck_during_global_render():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    tabs_index = source.index("st.tabs(")
-    before_tabs = source[:tabs_index]
+    navigation_index = source.index("selected_view = st.radio(")
+    before_navigation = source[:navigation_index]
 
-    assert "run_healthcheck(" not in before_tabs
+    assert "run_healthcheck(" not in before_navigation
     assert "recover_scanner_if_stale(" not in source
     assert "Run Full Healthcheck" in source
+
+
+def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+    navigation_index = source.index("selected_view = st.radio(")
+    top_level_section = source[: source.index('if selected_view == "Health":')]
+
+    assert "st.tabs(" not in top_level_section
+    assert 'if selected_view == "Market":' in source
+    assert navigation_index < source.index('if selected_view == "Health":')

@@ -1553,31 +1553,27 @@ runtime_preview = lightweight_dashboard_status(settings, store)
 inject_styles()
 render_intro(runtime_preview.status, runtime_preview.scanner_running)
 
-(
-    health_tab,
-    research_tab,
-    market_tab,
-    alerts_tab,
-    journal_tab,
-    performance_tab,
-    breakdowns_tab,
-    paper_tab,
-    improve_tab,
-) = st.tabs(
-    [
-        "Health",
-        "Research",
-        "Market",
-        "Alerts",
-        "Journal",
-        "Performance",
-        "Breakdowns",
-        "Paper",
-        "Improve",
-    ]
+DASHBOARD_VIEWS = [
+    "Health",
+    "Research",
+    "Market",
+    "Alerts",
+    "Journal",
+    "Performance",
+    "Breakdowns",
+    "Paper",
+    "Improve",
+]
+selected_view = st.radio(
+    "Dashboard section",
+    DASHBOARD_VIEWS,
+    index=DASHBOARD_VIEWS.index("Market"),
+    horizontal=True,
+    label_visibility="collapsed",
+    key="dashboard_view",
 )
 
-with health_tab:
+if selected_view == "Health":
     st.subheader("Scanner Controls")
     control_message = None
 
@@ -1668,10 +1664,10 @@ with health_tab:
                 height=360,
             )
 
-with research_tab:
+if selected_view == "Research":
     render_research_tab()
 
-with market_tab:
+if selected_view == "Market":
     st.subheader("Market Monitor")
     latest_setups = df("setups", 300)
     latest_alerts = df("alerts", 200)
@@ -1748,7 +1744,7 @@ with market_tab:
     else:
         show_table(latest_reviews.sort_values("created_at", ascending=False), height=340)
 
-with alerts_tab:
+if selected_view == "Alerts":
     st.subheader("Alerts")
     alerts = df("alerts", 200)
     setups = df("setups", 300)
@@ -1852,7 +1848,7 @@ with alerts_tab:
         with st.expander("Saved Alert Reviews"):
             show_table(reviews.sort_values("reviewed_at", ascending=False), height=360)
 
-with journal_tab:
+if selected_view == "Journal":
     st.subheader("Manual Trade Journal")
     if st.session_state.get("journal_flash"):
         st.success(st.session_state.pop("journal_flash"))
@@ -2239,7 +2235,7 @@ with journal_tab:
                         else:
                             st.warning("That trade was already removed.")
 
-with performance_tab:
+if selected_view == "Performance":
     st.subheader("Performance")
     trades = store.list_trades()
     metrics = calculate_metrics(trades)
@@ -2276,7 +2272,7 @@ with performance_tab:
             else:
                 show_table(values.sort_values("period", ascending=False), height=260)
 
-with breakdowns_tab:
+if selected_view == "Breakdowns":
     st.subheader("Breakdown Analytics")
     trades = store.list_trades()
     data = breakdowns(trades)
@@ -2293,7 +2289,7 @@ with breakdowns_tab:
                 height=320,
             )
 
-with paper_tab:
+if selected_view == "Paper":
     st.subheader("Paper Trading: Current Rules")
     st.caption(
         "This view shows current-rule paper W/L by lane. "
@@ -2576,7 +2572,7 @@ with paper_tab:
                 readable_events["source_label"] = readable_events.apply(paper_source_label, axis=1)
                 show_table(readable_events.sort_values("event_time", ascending=False), height=320)
 
-with improve_tab:
+if selected_view == "Improve":
     st.subheader("Improvement Lab")
     st.caption("Recommendations are analysis only. They never change live rules unless you review and approve them.")
     engine = RecommendationEngine()
