@@ -55,6 +55,7 @@ from trading_bot.runtime.scanner_process import (
     run_scan_once,
     start_scanner,
     stop_scanner,
+    summarize_scan_result,
 )
 from trading_bot.settings import load_settings
 from trading_bot.signal_sources import (
@@ -1754,14 +1755,20 @@ if selected_view == "Health":
     if c3.button("Run Scan Now", use_container_width=True, key="health_run_scan_now"):
         with st.spinner("Running one scanner cycle..."):
             result = run_scan_once()
-        if result.returncode == 0:
-            st.success("Scan completed.")
+        scan_summary = summarize_scan_result(result)
+        if scan_summary.success:
+            st.success(scan_summary.status_message)
         else:
-            st.error("Scan failed.")
-        if result.stdout:
-            st.code(result.stdout)
-        if result.stderr:
-            st.code(result.stderr)
+            st.error(scan_summary.status_message)
+        if scan_summary.stdout:
+            st.code(scan_summary.stdout)
+        if scan_summary.diagnostics:
+            if scan_summary.success:
+                st.warning("Scan completed with nonfatal diagnostics.")
+                with st.expander("Technical diagnostics"):
+                    st.code(scan_summary.diagnostics)
+            else:
+                st.code(scan_summary.diagnostics)
     if c4.button("Refresh Status", use_container_width=True, key="health_refresh_status"):
         control_message = ("success", "scanner status refreshed")
     if c5.button("Send Test", use_container_width=True, key="health_send_telegram_test"):

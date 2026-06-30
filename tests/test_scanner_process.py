@@ -5,11 +5,13 @@ from pathlib import Path
 
 from trading_bot.runtime import scanner_process
 from trading_bot.runtime.scanner_process import (
+    clean_scan_stderr,
     is_pid_running,
     read_pid,
     recover_scanner_if_stale,
     reconcile_scanner_status,
     run_scan_once,
+    summarize_scan_result,
     scanner_status,
     start_scanner,
     start_watchdog,
@@ -49,6 +51,34 @@ def test_run_scan_once_uses_supplied_command():
 
     assert result.returncode == 0
     assert "scan-ok" in result.stdout
+
+
+def test_clean_scan_stderr_hides_benign_urllib3_openssl_warning():
+    stderr = "\n".join(
+        [
+            "/venv/lib/python3.9/site-packages/urllib3/__init__.py:35: "
+            "NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+",
+            "  warnings.warn(",
+        ]
+    )
+
+    assert clean_scan_stderr(stderr) == ""
+
+
+def test_summarize_scan_result_keeps_successful_diagnostics_as_nonfatal():
+    result = scanner_process.subprocess.CompletedProcess(
+        args=["python", "-m", "trading_bot", "scan", "--once"],
+        returncode=0,
+        stdout="{'alerts': [], 'errors': []}\n",
+        stderr="ERROR yfinance: transient feed warning handled by fallback\n",
+    )
+
+    summary = summarize_scan_result(result)
+
+    assert summary.success
+    assert summary.status_message == "Scan completed."
+    assert summary.stdout == "{'alerts': [], 'errors': []}"
+    assert summary.diagnostics == "ERROR yfinance: transient feed warning handled by fallback"
 
 
 def test_watchdog_process_start_stop(tmp_path):

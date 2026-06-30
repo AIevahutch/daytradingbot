@@ -41,6 +41,14 @@ class ScannerWatchdogResult:
         return self.status.message
 
 
+@dataclass(frozen=True)
+class ScanRunSummary:
+    success: bool
+    status_message: str
+    stdout: str = ""
+    diagnostics: str = ""
+
+
 def default_scanner_command() -> List[str]:
     return [sys.executable, "-m", "trading_bot", "scan"]
 
@@ -434,6 +442,36 @@ def run_scan_once(
         text=True,
         capture_output=True,
         timeout=timeout_seconds,
+    )
+
+
+def clean_scan_stderr(stderr: Optional[str]) -> str:
+    if not stderr:
+        return ""
+
+    cleaned_lines = []
+    skip_warning_source_line = False
+    for raw_line in stderr.splitlines():
+        line = raw_line.rstrip()
+        if "NotOpenSSLWarning" in line:
+            skip_warning_source_line = True
+            continue
+        if skip_warning_source_line and line.strip().startswith("warnings.warn("):
+            skip_warning_source_line = False
+            continue
+        skip_warning_source_line = False
+        if line.strip():
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def summarize_scan_result(result: subprocess.CompletedProcess) -> ScanRunSummary:
+    success = result.returncode == 0
+    return ScanRunSummary(
+        success=success,
+        status_message="Scan completed." if success else "Scan failed.",
+        stdout=(result.stdout or "").strip(),
+        diagnostics=clean_scan_stderr(result.stderr or ""),
     )
 
 
