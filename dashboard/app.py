@@ -1770,7 +1770,13 @@ if selected_view == "Health":
             else:
                 st.code(scan_summary.diagnostics)
     if c4.button("Refresh Status", use_container_width=True, key="health_refresh_status"):
-        control_message = ("success", "scanner status refreshed")
+        st.cache_data.clear()
+        with st.spinner("Refreshing live status..."):
+            st.session_state["full_healthcheck_result"] = run_healthcheck(settings, store)
+        control_message = (
+            "success",
+            "status refreshed from live scanner, database, and watchdog state",
+        )
     if c5.button("Send Test", use_container_width=True, key="health_send_telegram_test"):
         delivered, error = send_telegram_test_message()
         if delivered:

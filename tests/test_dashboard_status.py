@@ -86,3 +86,14 @@ def test_dashboard_market_uses_batched_fast_reads():
     assert "dashboard_frames(" in source
     assert "latest_symbol_candles(" in source
     assert "lightweight_dashboard_status(settings, store)" not in source
+
+
+def test_dashboard_refresh_status_button_refreshes_cached_health_data():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+    button_index = source.index('key="health_refresh_status"')
+    next_button_index = source.index('key="health_send_telegram_test"', button_index)
+    refresh_block = source[button_index:next_button_index]
+
+    assert "st.cache_data.clear()" in refresh_block
+    assert 'st.session_state["full_healthcheck_result"] = run_healthcheck(settings, store)' in refresh_block
+    assert "status refreshed from live scanner, database, and watchdog state" in refresh_block
