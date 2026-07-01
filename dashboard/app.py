@@ -33,7 +33,6 @@ from trading_bot.dashboard_db import (
 )
 from trading_bot.dashboard_navigation import (
     DASHBOARD_VIEW_QUERY_PARAM,
-    dashboard_view_href,
     normalize_dashboard_view,
 )
 from trading_bot.dashboard_status import lightweight_dashboard_status
@@ -847,6 +846,25 @@ def render_breakdown_metric_cards(frame: pd.DataFrame) -> None:
             }
         )
     render_analytics_card_grid(cards)
+
+
+def dashboard_nav_key(view: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", view.lower()).strip("_")
+    return f"dashboard_nav_{slug}"
+
+
+def render_dashboard_navigation(views: list[str], selected: str) -> None:
+    nav_cols = st.columns(len(views))
+    for nav_col, view in zip(nav_cols, views):
+        clicked = nav_col.button(
+            view,
+            type="primary" if view == selected else "secondary",
+            use_container_width=True,
+            key=dashboard_nav_key(view),
+        )
+        if clicked and view != selected:
+            st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = view
+            rerun_dashboard()
 
 
 def link_action(label: str, url: str) -> None:
@@ -1894,15 +1912,7 @@ selected_view = normalize_dashboard_view(
 )
 if requested_view_param != selected_view:
     st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = selected_view
-nav_cols = st.columns(len(DASHBOARD_VIEWS))
-current_query_params = dict(st.query_params)
-for nav_col, view in zip(nav_cols, DASHBOARD_VIEWS):
-    nav_col.link_button(
-        view,
-        dashboard_view_href(view, current_params=current_query_params),
-        type="primary" if view == selected_view else "secondary",
-        use_container_width=True,
-    )
+render_dashboard_navigation(DASHBOARD_VIEWS, selected_view)
 enable_auto_refresh()
 
 if selected_view == "Health":

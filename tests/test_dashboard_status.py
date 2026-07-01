@@ -55,12 +55,16 @@ def test_dashboard_does_not_run_full_healthcheck_during_global_render():
 
 def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    navigation_index = source.index("nav_cols = st.columns(")
+    navigation_index = source.index("render_dashboard_navigation(")
     top_level_section = source[: source.index('if selected_view == "Health":')]
+    navigation_section = source[
+        source.index("DASHBOARD_VIEWS = [") : source.index('if selected_view == "Health":')
+    ]
 
     assert "st.tabs(" not in top_level_section
     assert "st.radio(" not in top_level_section
-    assert "link_button(" in top_level_section
+    assert ".link_button(" not in navigation_section
+    assert "render_dashboard_navigation(" in top_level_section
     assert 'if selected_view == "Market":' in source
     assert navigation_index < source.index('if selected_view == "Health":')
 
