@@ -92,6 +92,25 @@ def test_dashboard_market_uses_batched_fast_reads():
     assert "lightweight_dashboard_status(settings, store)" not in source
 
 
+def test_dashboard_current_setup_does_not_look_like_latest_scan_when_stale():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+    priority_section = source[
+        source.index("def prioritize_market_setups(") : source.index(
+            "def latest_symbol_scan_entry("
+        )
+    ]
+    override_section = source[
+        source.index("def heartbeat_no_trade_overrides_setup(") : source.index(
+            "def safe_latest_scan_heartbeat("
+        )
+    ]
+
+    assert 'f"Setup created {format_datetime(row.get' in source
+    assert 'f"Setup scan {format_datetime(row.get' not in source
+    assert '["created_at", "_status_priority", "_confidence_sort"]' in priority_section
+    assert 'status == "alert_ready"' not in override_section
+
+
 def test_dashboard_refresh_status_button_refreshes_cached_health_data():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
     button_index = source.index('key="health_refresh_status"')

@@ -970,7 +970,7 @@ def render_setup_summary(
         market_status = "ok" if age_minutes <= settings.stale_data_minutes else "warn"
     title = f"{row.get('symbol', '')} {row.get('direction', '')} {row.get('setup_type', '')}"
     meta = (
-        f"Setup scan {format_datetime(row.get('created_at'))} | "
+        f"Setup created {format_datetime(row.get('created_at'))} | "
         f"Risk/reward {float(row.get('risk_reward') or 0):.2f} | "
         f"{row.get('market_condition', 'unknown')}"
     )
@@ -1181,8 +1181,8 @@ def prioritize_market_setups(symbol_setups: pd.DataFrame) -> pd.DataFrame:
     candidates["_status_priority"] = candidates["status"].map(status_priority).fillna(2)
     candidates["_confidence_sort"] = pd.to_numeric(candidates["confidence"], errors="coerce").fillna(0)
     return candidates.sort_values(
-        ["_status_priority", "_confidence_sort", "created_at"],
-        ascending=[True, False, False],
+        ["created_at", "_status_priority", "_confidence_sort"],
+        ascending=[False, True, False],
     )
 
 
@@ -1212,9 +1212,6 @@ def heartbeat_no_trade_overrides_setup(
     setup: Optional[Union[pd.Series, dict]],
 ) -> bool:
     if setup is None:
-        return False
-    status = safe_text(setup.get("status"))
-    if status == "alert_ready":
         return False
     scan_key, _ = latest_symbol_scan_entry(heartbeat, symbol)
     if scan_key != "no_trade":
