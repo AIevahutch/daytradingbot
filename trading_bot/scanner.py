@@ -57,6 +57,7 @@ from trading_bot.storage import SQLiteStore
 from trading_bot.strategy.engine import StrategyEngine, fast_intraday_bias, trend_bias
 
 logger = logging.getLogger(__name__)
+FAST_MOMENTUM_PAPER_COOLDOWN_MINUTES = 20
 
 
 def _parse_session_time(value: str) -> dt_time:
@@ -512,6 +513,11 @@ class TradingScanner:
         setup: SetupSignal,
         setup_id: int,
     ) -> None:
+        if self._recent_fast_momentum_paper_signal_exists(setup):
+            result["no_trade"].append(
+                f"Fast Momentum {setup.symbol}: duplicate paper signal suppressed"
+            )
+            return
         session_date = current_session_date(self.settings).isoformat()
         run_id = self.store.get_or_create_paper_run(
             LIVE_FAST_MOMENTUM_PAPER_SOURCE,
@@ -537,6 +543,39 @@ class TradingScanner:
             f"Fast Momentum {setup.symbol}: {setup.timeframe} {setup.direction} "
             f"{setup.confidence}/100 paper-tracked dashboard-only"
         )
+
+    def _recent_fast_momentum_paper_signal_exists(self, setup: SetupSignal) -> bool:
+        setup_time = setup.created_at
+        if setup_time.tzinfo is not None:
+            setup_time = setup_time.replace(tzinfo=None)
+        cooldown = timedelta(minutes=FAST_MOMENTUM_PAPER_COOLDOWN_MINUTES)
+        events = live_paper.list_live_experimental_lane_paper_events(
+            self.store,
+            LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+            limit=500,
+        )
+        for event in events:
+            if event.get("symbol") != setup.symbol:
+                continue
+            if str(event.get("direction") or "").upper() != setup.direction.upper():
+                continue
+            if str(event.get("setup_type") or "") != setup.setup_type:
+                continue
+            try:
+                metadata = json.loads(event.get("metadata_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if str(metadata.get("timeframe") or "") != setup.timeframe:
+                continue
+            try:
+                event_time = datetime.fromisoformat(str(event["event_time"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if event_time.tzinfo is not None:
+                event_time = event_time.replace(tzinfo=None)
+            if abs((setup_time - event_time).total_seconds()) <= cooldown.total_seconds():
+                return True
+        return False
 
     def _record_high_potential_liquidity_sweep(
         self,

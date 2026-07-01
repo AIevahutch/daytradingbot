@@ -85,6 +85,28 @@ def refresh_live_failed_auction_trap_outcomes(store: SQLiteStore) -> Dict[str, i
     return refresh_live_source_outcomes(store, list_live_failed_auction_trap_paper_events)
 
 
+def refresh_live_fast_momentum_outcomes(store: SQLiteStore) -> Dict[str, int]:
+    return refresh_live_source_outcomes(
+        store,
+        lambda store_obj: list_live_experimental_lane_paper_events(
+            store_obj,
+            LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        ),
+    )
+
+
+def refresh_live_high_potential_liquidity_sweep_outcomes(
+    store: SQLiteStore,
+) -> Dict[str, int]:
+    return refresh_live_source_outcomes(
+        store,
+        lambda store_obj: list_live_experimental_lane_paper_events(
+            store_obj,
+            LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        ),
+    )
+
+
 def current_live_100_snapshot(
     store: SQLiteStore,
     excluded_setup_types: Optional[Iterable[str]] = None,
@@ -116,6 +138,10 @@ def refresh_all_live_outcomes(
         ),
         "carter_put": lambda: refresh_live_carter_put_outcomes(store),
         "failed_auction_trap": lambda: refresh_live_failed_auction_trap_outcomes(store),
+        "fast_momentum": lambda: refresh_live_fast_momentum_outcomes(store),
+        "high_potential_liquidity_sweep": lambda: refresh_live_high_potential_liquidity_sweep_outcomes(
+            store
+        ),
     }
     results: Dict[str, Dict] = {}
     for lane, refresh in refreshers.items():

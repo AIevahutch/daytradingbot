@@ -682,6 +682,78 @@ def test_scanner_paper_tracks_fast_momentum_without_telegram(tmp_path):
     assert metadata["signal_source"] == FAST_MOMENTUM_SIGNAL_SOURCE
 
 
+def test_fast_momentum_paper_tracking_dedupes_same_burst(tmp_path):
+    settings = Settings(
+        symbols=["SPY"],
+        database_path=str(tmp_path / "fast_momentum_dedupe.sqlite"),
+        telegram_retry_delay_seconds=0,
+        max_alerts_per_symbol_per_day=3,
+    )
+    settings.research["enabled"] = False
+    store = SQLiteStore(settings.database_file)
+    telegram = RecordingTelegram()
+    base_time = datetime(2026, 7, 1, 13, 35)
+
+    class RepeatedFastMomentumStrategy:
+        calls = 0
+
+        def detect(
+            self,
+            symbol,
+            candles_by_tf,
+            levels,
+            market_biases,
+            stale_data=False,
+            alert_timeframes=None,
+        ):
+            created_at = base_time + timedelta(minutes=self.calls)
+            self.calls += 1
+            return [
+                SetupSignal(
+                    symbol=symbol,
+                    setup_type="Fast momentum expansion",
+                    direction="SHORT",
+                    timeframe="5m",
+                    created_at=created_at,
+                    entry_low=100.0,
+                    entry_high=100.2,
+                    stop_loss=101.0,
+                    target1=99.0,
+                    target2=98.0,
+                    invalidation=101.0,
+                    risk_reward=1.0,
+                    reasoning="Same momentum burst.",
+                    avoid_if="Momentum candle is reclaimed.",
+                    features={
+                        "fast_momentum_expansion": True,
+                        "midday_momentum_exception": True,
+                        "timeframe_aligned": True,
+                        "market_confirmed": True,
+                    },
+                )
+            ]
+
+    scanner = TradingScanner(
+        settings,
+        store,
+        data_engine=FakeDataEngine(),
+        telegram=telegram,
+    )
+    scanner.strategy = RepeatedFastMomentumStrategy()
+    scanner.carter_squeeze = EmptyCarterSqueeze()
+    scanner.failed_auction_trap = EmptyFailedAuctionTrap()
+    scanner.no_trade = FakeNoTrade()
+
+    first = scanner.scan_once()
+    second = scanner.scan_once()
+
+    assert any("Fast Momentum SPY" in item for item in first["watch_only"])
+    assert any("duplicate paper signal suppressed" in item for item in second["no_trade"])
+    assert store.list_rows("alerts", 10) == []
+    paper_events = store.list_rows("paper_events", 10)
+    assert len(paper_events) == 1
+
+
 def test_scanner_paper_tracks_high_potential_liquidity_sweep_without_telegram(tmp_path):
     settings = Settings(
         symbols=["IWM"],
@@ -1080,6 +1152,110 @@ def test_experimental_lane_metrics_separate_open_and_closed_signals(tmp_path):
     ] == "Collecting evidence"
 
 
+def test_refresh_all_live_outcomes_closes_experimental_lanes(tmp_path):
+    settings = Settings(database_path=str(tmp_path / "experimental_refresh_all.sqlite"))
+    store = SQLiteStore(settings.database_file)
+    fast_run_id = store.get_or_create_paper_run(
+        LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        "2026-07-01",
+        ["SPY"],
+    )
+    sweep_run_id = store.get_or_create_paper_run(
+        LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        "2026-07-01",
+        ["IWM"],
+    )
+    base_time = datetime(2026, 7, 1, 13, 35)
+    fast_setup = SetupSignal(
+        symbol="SPY",
+        setup_type="Fast momentum expansion",
+        direction="SHORT",
+        timeframe="5m",
+        created_at=base_time,
+        entry_low=100.0,
+        entry_high=100.2,
+        stop_loss=101.0,
+        target1=99.0,
+        target2=98.0,
+        invalidation=101.0,
+        confidence=100,
+        risk_reward=1.0,
+        reasoning="Dashboard-only fast expansion.",
+        avoid_if="SPY reclaims impulse high.",
+        status="watch_only",
+    )
+    sweep_setup = SetupSignal(
+        symbol="IWM",
+        setup_type="Liquidity sweep reversal",
+        direction="LONG",
+        timeframe="15m",
+        created_at=base_time,
+        entry_low=200.0,
+        entry_high=200.2,
+        stop_loss=199.5,
+        target1=201.2,
+        target2=202.4,
+        invalidation=199.5,
+        confidence=98,
+        risk_reward=2.0,
+        reasoning="High-potential balanced sweep.",
+        avoid_if="SPY/QQQ lose agreement.",
+        status="watch_only",
+    )
+    fast_event_id = store.insert_source_paper_signal(
+        fast_run_id,
+        setup_id=1,
+        setup=fast_setup,
+        mode=LIVE_FAST_MOMENTUM_PAPER_SOURCE,
+        source_key=FAST_MOMENTUM_SIGNAL_SOURCE,
+        source_label=FAST_MOMENTUM_SOURCE_LABEL,
+        notes="Synthetic fast momentum row.",
+    )
+    sweep_event_id = store.insert_source_paper_signal(
+        sweep_run_id,
+        setup_id=2,
+        setup=sweep_setup,
+        mode=LIVE_HIGH_POTENTIAL_LIQUIDITY_SWEEP_PAPER_SOURCE,
+        source_key=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SIGNAL_SOURCE,
+        source_label=HIGH_POTENTIAL_LIQUIDITY_SWEEP_SOURCE_LABEL,
+        notes="Synthetic high-potential row.",
+    )
+    store.upsert_candles(
+        [
+            Candle(
+                "SPY",
+                "1m",
+                base_time + timedelta(minutes=1),
+                100.0,
+                100.1,
+                99.1,
+                99.2,
+                1000,
+                "test",
+            ),
+            Candle(
+                "IWM",
+                "1m",
+                base_time + timedelta(minutes=1),
+                200.1,
+                200.8,
+                200.0,
+                200.7,
+                1000,
+                "test",
+            ),
+        ]
+    )
+
+    summaries = refresh_all_live_outcomes(store)
+    events = {event["id"]: event for event in store.list_rows("paper_events", 10)}
+
+    assert summaries["fast_momentum"]["wins"] == 1
+    assert summaries["high_potential_liquidity_sweep"]["wins"] == 1
+    assert events[int(fast_event_id)]["outcome"] == "win"
+    assert events[int(sweep_event_id)]["outcome"] == "win"
+
+
 def test_live_100_paper_outcomes_update_from_candles(tmp_path):
     settings = Settings(symbols=["SPY"], database_path=str(tmp_path / "live_outcomes.sqlite"))
     store = SQLiteStore(settings.database_file)
@@ -1273,12 +1449,24 @@ def test_refresh_all_live_outcomes_reports_locked_lane(tmp_path, monkeypatch):
         "refresh_live_failed_auction_trap_outcomes",
         lambda *_args: {"updated": 0},
     )
+    monkeypatch.setattr(
+        live_paper_module,
+        "refresh_live_fast_momentum_outcomes",
+        lambda *_args: {"updated": 0},
+    )
+    monkeypatch.setattr(
+        live_paper_module,
+        "refresh_live_high_potential_liquidity_sweep_outcomes",
+        lambda *_args: {"updated": 0},
+    )
 
     summaries = refresh_all_live_outcomes(store)
 
     assert summaries["core"] == {"updated": 0, "error": "database_locked"}
     assert summaries["carter_put"] == {"updated": 0}
     assert summaries["failed_auction_trap"] == {"updated": 0}
+    assert summaries["fast_momentum"] == {"updated": 0}
+    assert summaries["high_potential_liquidity_sweep"] == {"updated": 0}
 
 
 def test_scanner_paper_refresh_hook_reports_updates_and_busy_database(tmp_path, monkeypatch):
