@@ -314,6 +314,66 @@ def inject_styles() -> None:
         .subtle {
           color: var(--muted);
         }
+        .analytics-card-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 10px;
+          margin: 8px 0 18px 0;
+        }
+        .analytics-card {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          padding: 12px 14px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+          min-width: 0;
+        }
+        .analytics-card-title {
+          color: var(--ink);
+          font-size: 0.95rem;
+          font-weight: 720;
+          line-height: 1.25;
+          margin: 0 0 10px 0;
+          overflow-wrap: anywhere;
+        }
+        .analytics-metric-list {
+          display: grid;
+          gap: 7px;
+        }
+        .analytics-metric-row {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 10px;
+          border-top: 1px solid #eef1f4;
+          padding-top: 7px;
+          min-width: 0;
+        }
+        .analytics-metric-row:first-child {
+          border-top: 0;
+          padding-top: 0;
+        }
+        .analytics-metric-label {
+          color: var(--muted);
+          font-size: 0.78rem;
+          line-height: 1.2;
+          min-width: 0;
+        }
+        .analytics-metric-value {
+          color: var(--ink);
+          font-size: 0.9rem;
+          font-weight: 700;
+          line-height: 1.2;
+          text-align: right;
+          overflow-wrap: anywhere;
+          min-width: 0;
+        }
+        .analytics-metric-value.positive {
+          color: var(--green);
+        }
+        .analytics-metric-value.negative {
+          color: var(--red);
+        }
         .research-grid {
           display: grid;
           grid-template-columns: repeat(4, minmax(118px, 1fr));
@@ -683,6 +743,110 @@ def show_table(frame: pd.DataFrame, *, height: Optional[int] = None) -> None:
         hide_index=True,
         height=height,
     )
+
+
+def format_money(value) -> str:
+    numeric = safe_float(value)
+    sign = "-" if numeric < 0 else ""
+    return f"{sign}${abs(numeric):,.2f}"
+
+
+def format_percent(value) -> str:
+    return f"{safe_float(value):.1f}%"
+
+
+def format_whole_number(value) -> str:
+    return f"{safe_int(value):,}"
+
+
+def analytics_value_class(raw_value) -> str:
+    numeric = safe_float(raw_value)
+    if numeric > 0:
+        return "positive"
+    if numeric < 0:
+        return "negative"
+    return ""
+
+
+def render_analytics_card_grid(cards: list[dict]) -> None:
+    if not cards:
+        st.info("No data")
+        return
+
+    html = ['<div class="analytics-card-grid">']
+    for card in cards:
+        html.append('<div class="analytics-card">')
+        html.append(f'<p class="analytics-card-title">{escape(str(card["title"]))}</p>')
+        html.append('<div class="analytics-metric-list">')
+        for metric in card["metrics"]:
+            value_class = metric.get("value_class", "")
+            class_attr = f" {escape(value_class)}" if value_class else ""
+            html.append(
+                '<div class="analytics-metric-row">'
+                f'<span class="analytics-metric-label">{escape(str(metric["label"]))}</span>'
+                f'<span class="analytics-metric-value{class_attr}">{escape(str(metric["value"]))}</span>'
+                "</div>"
+            )
+        html.append("</div></div>")
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def render_period_summary_cards(period_name: str, period_values: dict) -> None:
+    st.markdown(f"#### {escape(period_name.title())}")
+    sorted_values = sorted(period_values.items(), key=lambda item: item[0], reverse=True)
+    cards = [
+        {
+            "title": period,
+            "metrics": [
+                {
+                    "label": "Realized P/L",
+                    "value": format_money(value),
+                    "value_class": analytics_value_class(value),
+                }
+            ],
+        }
+        for period, value in sorted_values
+    ]
+    render_analytics_card_grid(cards)
+
+
+def render_breakdown_metric_cards(frame: pd.DataFrame) -> None:
+    if frame.empty:
+        st.info("No data")
+        return
+
+    cards = []
+    for row in frame.to_dict("records"):
+        total_pl = row.get("total_pl")
+        expectancy = row.get("expectancy")
+        drawdown = row.get("max_drawdown")
+        cards.append(
+            {
+                "title": row.get("group") or "unknown",
+                "metrics": [
+                    {
+                        "label": "Total P/L",
+                        "value": format_money(total_pl),
+                        "value_class": analytics_value_class(total_pl),
+                    },
+                    {"label": "Trades", "value": format_whole_number(row.get("trade_count"))},
+                    {"label": "Win Rate", "value": format_percent(row.get("win_rate"))},
+                    {
+                        "label": "Expectancy",
+                        "value": format_money(expectancy),
+                        "value_class": analytics_value_class(expectancy),
+                    },
+                    {"label": "Profit Factor", "value": format_profit_factor(row.get("profit_factor"))},
+                    {
+                        "label": "Max DD",
+                        "value": format_money(drawdown),
+                        "value_class": analytics_value_class(drawdown),
+                    },
+                ],
+            }
+        )
+    render_analytics_card_grid(cards)
 
 
 def link_action(label: str, url: str) -> None:
@@ -2453,37 +2617,25 @@ if selected_view == "Performance":
             xaxis_title=None,
             yaxis_title="Equity",
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     periods = period_pl(trades)
-    pcols = st.columns(3)
-    for col, name in zip(pcols, ["daily", "weekly", "monthly"]):
-        values = pd.DataFrame(
-            [{"period": key, "pl": value} for key, value in periods[name].items()]
-        )
-        with col:
-            st.write(name.title())
-            if values.empty:
-                st.info("No data")
-            else:
-                show_table(values.sort_values("period", ascending=False), height=260)
+    for name in ["daily", "weekly", "monthly"]:
+        render_period_summary_cards(name, periods[name])
 
 if selected_view == "Breakdowns":
     st.subheader("Breakdown Analytics")
     trades = df("trades", 500).to_dict("records")
     data = breakdowns(trades)
     for name, metrics_by_group in data.items():
-        st.write(name.replace("_", " ").title())
+        st.markdown(f"#### {name.replace('_', ' ').title()}")
         table = pd.DataFrame(
             [{"group": group, **metrics} for group, metrics in metrics_by_group.items()]
         )
-        if table.empty:
-            st.info("No data")
-        else:
-            show_table(
-                table.drop(columns=["equity_curve"], errors="ignore"),
-                height=320,
-            )
+        breakdown_table = table.drop(columns=["equity_curve"], errors="ignore")
+        if "total_pl" in breakdown_table.columns:
+            breakdown_table = breakdown_table.sort_values("total_pl", ascending=False)
+        render_breakdown_metric_cards(breakdown_table)
 
 if selected_view == "Paper":
     st.subheader("Paper Trading: Current Rules")

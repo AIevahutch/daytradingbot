@@ -97,3 +97,24 @@ def test_dashboard_refresh_status_button_refreshes_cached_health_data():
     assert "st.cache_data.clear()" in refresh_block
     assert 'st.session_state["full_healthcheck_result"] = run_healthcheck(settings, store)' in refresh_block
     assert "status refreshed from live scanner, database, and watchdog state" in refresh_block
+
+
+def test_performance_and_breakdowns_use_responsive_summary_cards():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+    performance_section = source[
+        source.index('if selected_view == "Performance":') : source.index(
+            'if selected_view == "Breakdowns":'
+        )
+    ]
+    breakdowns_section = source[
+        source.index('if selected_view == "Breakdowns":') : source.index(
+            'if selected_view == "Paper":'
+        )
+    ]
+
+    assert "render_period_summary_cards(" in performance_section
+    assert "render_breakdown_metric_cards(" in breakdowns_section
+    assert "show_table(" not in performance_section
+    assert "show_table(" not in breakdowns_section
+    assert 'if "total_pl" in breakdown_table.columns:' in breakdowns_section
+    assert 'st.plotly_chart(fig, width="stretch")' not in performance_section
