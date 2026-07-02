@@ -78,7 +78,9 @@ def test_dashboard_navigation_labels_do_not_wrap_inside_squeezed_columns():
     ]
 
     assert "st.columns(len(views))" not in navigation_function
-    assert "dashboard-nav-item" in navigation_function
+    assert "href=" not in navigation_function
+    assert ".button(" in navigation_function
+    assert "DASHBOARD_NAV_ROW_SIZE" in navigation_function
     assert "white-space: nowrap;" in source
 
 

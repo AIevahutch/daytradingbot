@@ -10,7 +10,6 @@ from pathlib import Path
 import re
 import sys
 from typing import Optional, Union
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -76,6 +75,7 @@ st.set_page_config(page_title="SPY/QQQ/IWM Alert Bot", layout="wide")
 AUTO_REFRESH_SECONDS = 60
 DASHBOARD_CACHE_TTL_SECONDS = 5
 DASHBOARD_DB_TIMEOUT_SECONDS = 0.25
+DASHBOARD_NAV_ROW_SIZE = 5
 EXPERIMENT_PROMOTION_RULES = """Promotion gate for any experimental setup lane:
 
 1. Dashboard-only first. No Telegram alerts and no core-score mixing while it is experimental.
@@ -288,41 +288,10 @@ def inject_styles() -> None:
           border-color: #bfdcff;
           color: #0757a8;
         }
-        .dashboard-nav {
-          display: flex;
-          flex-wrap: nowrap;
-          gap: 8px;
-          margin: 0 0 18px 0;
-          padding: 0 0 6px 0;
-          overflow-x: auto;
-          scrollbar-width: thin;
-        }
-        .dashboard-nav-item {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          flex: 0 0 auto;
-          min-height: 40px;
-          padding: 8px 14px;
-          border-radius: 8px;
-          border: 1px solid var(--line);
-          background: var(--panel);
-          color: var(--ink);
-          font-size: 0.9rem;
-          font-weight: 650;
-          line-height: 1.15;
-          text-decoration: none !important;
+        .stButton button p {
           white-space: nowrap;
-          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-        }
-        .dashboard-nav-item:hover {
-          border-color: #b9c1ba;
-          color: var(--ink);
-        }
-        .dashboard-nav-item.active {
-          background: var(--ink);
-          border-color: var(--ink);
-          color: #ffffff;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .mini-card {
           background: var(--panel);
@@ -923,18 +892,25 @@ def render_breakdown_metric_cards(frame: pd.DataFrame) -> None:
     render_analytics_card_grid(cards)
 
 
+def dashboard_nav_key(view: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", view.lower()).strip("_")
+    return f"dashboard_nav_{slug}"
+
+
 def render_dashboard_navigation(views: list[str], selected: str) -> None:
-    links = ['<nav class="dashboard-nav" aria-label="Dashboard sections">']
-    for view in views:
-        active_class = " active" if view == selected else ""
-        current_attr = ' aria-current="page"' if view == selected else ""
-        url = f"?{DASHBOARD_VIEW_QUERY_PARAM}={quote(view)}"
-        links.append(
-            f'<a class="dashboard-nav-item{active_class}" href="{url}"{current_attr}>'
-            f"{escape(view)}</a>"
-        )
-    links.append("</nav>")
-    st.markdown("".join(links), unsafe_allow_html=True)
+    for start_index in range(0, len(views), DASHBOARD_NAV_ROW_SIZE):
+        row_views = views[start_index : start_index + DASHBOARD_NAV_ROW_SIZE]
+        nav_cols = st.columns(len(row_views))
+        for nav_col, view in zip(nav_cols, row_views):
+            clicked = nav_col.button(
+                view,
+                type="primary" if view == selected else "secondary",
+                use_container_width=True,
+                key=dashboard_nav_key(view),
+            )
+            if clicked and view != selected:
+                st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = view
+                rerun_dashboard()
 
 
 def link_action(label: str, url: str) -> None:
