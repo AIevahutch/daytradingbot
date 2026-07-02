@@ -45,7 +45,7 @@ def test_lightweight_dashboard_status_handles_busy_database(tmp_path):
 
 def test_dashboard_does_not_run_full_healthcheck_during_global_render():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    navigation_index = source.index("nav_cols = st.columns(")
+    navigation_index = source.index("render_dashboard_navigation(DASHBOARD_VIEWS, selected_view)")
     before_navigation = source[:navigation_index]
 
     assert "run_healthcheck(" not in before_navigation
@@ -55,7 +55,7 @@ def test_dashboard_does_not_run_full_healthcheck_during_global_render():
 
 def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
     source = Path("dashboard/app.py").read_text(encoding="utf-8")
-    navigation_index = source.index("render_dashboard_navigation(")
+    navigation_index = source.index("render_dashboard_navigation(DASHBOARD_VIEWS, selected_view)")
     top_level_section = source[: source.index('if selected_view == "Health":')]
     navigation_section = source[
         source.index("DASHBOARD_VIEWS = [") : source.index('if selected_view == "Health":')
@@ -67,6 +67,19 @@ def test_dashboard_uses_lazy_top_level_navigation_instead_of_eager_tabs():
     assert "render_dashboard_navigation(" in top_level_section
     assert 'if selected_view == "Market":' in source
     assert navigation_index < source.index('if selected_view == "Health":')
+
+
+def test_dashboard_navigation_labels_do_not_wrap_inside_squeezed_columns():
+    source = Path("dashboard/app.py").read_text(encoding="utf-8")
+    navigation_function = source[
+        source.index("def render_dashboard_navigation(") : source.index(
+            "def link_action("
+        )
+    ]
+
+    assert "st.columns(len(views))" not in navigation_function
+    assert "dashboard-nav-item" in navigation_function
+    assert "white-space: nowrap;" in source
 
 
 def test_dashboard_startup_avoids_module_reloads_and_schema_initialization():

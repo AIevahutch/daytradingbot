@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Optional, Union
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -286,6 +287,42 @@ def inject_styles() -> None:
           background: #edf5ff;
           border-color: #bfdcff;
           color: #0757a8;
+        }
+        .dashboard-nav {
+          display: flex;
+          flex-wrap: nowrap;
+          gap: 8px;
+          margin: 0 0 18px 0;
+          padding: 0 0 6px 0;
+          overflow-x: auto;
+          scrollbar-width: thin;
+        }
+        .dashboard-nav-item {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          flex: 0 0 auto;
+          min-height: 40px;
+          padding: 8px 14px;
+          border-radius: 8px;
+          border: 1px solid var(--line);
+          background: var(--panel);
+          color: var(--ink);
+          font-size: 0.9rem;
+          font-weight: 650;
+          line-height: 1.15;
+          text-decoration: none !important;
+          white-space: nowrap;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        .dashboard-nav-item:hover {
+          border-color: #b9c1ba;
+          color: var(--ink);
+        }
+        .dashboard-nav-item.active {
+          background: var(--ink);
+          border-color: var(--ink);
+          color: #ffffff;
         }
         .mini-card {
           background: var(--panel);
@@ -886,23 +923,18 @@ def render_breakdown_metric_cards(frame: pd.DataFrame) -> None:
     render_analytics_card_grid(cards)
 
 
-def dashboard_nav_key(view: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", view.lower()).strip("_")
-    return f"dashboard_nav_{slug}"
-
-
 def render_dashboard_navigation(views: list[str], selected: str) -> None:
-    nav_cols = st.columns(len(views))
-    for nav_col, view in zip(nav_cols, views):
-        clicked = nav_col.button(
-            view,
-            type="primary" if view == selected else "secondary",
-            use_container_width=True,
-            key=dashboard_nav_key(view),
+    links = ['<nav class="dashboard-nav" aria-label="Dashboard sections">']
+    for view in views:
+        active_class = " active" if view == selected else ""
+        current_attr = ' aria-current="page"' if view == selected else ""
+        url = f"?{DASHBOARD_VIEW_QUERY_PARAM}={quote(view)}"
+        links.append(
+            f'<a class="dashboard-nav-item{active_class}" href="{url}"{current_attr}>'
+            f"{escape(view)}</a>"
         )
-        if clicked and view != selected:
-            st.query_params[DASHBOARD_VIEW_QUERY_PARAM] = view
-            rerun_dashboard()
+    links.append("</nav>")
+    st.markdown("".join(links), unsafe_allow_html=True)
 
 
 def link_action(label: str, url: str) -> None:
