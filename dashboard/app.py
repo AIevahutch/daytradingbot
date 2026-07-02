@@ -313,6 +313,26 @@ def inject_styles() -> None:
         .subtle {
           color: var(--muted);
         }
+        .dashboard-section-header {
+          margin: 4px 0 14px 0;
+          padding: 0;
+        }
+        .dashboard-section-header-title {
+          color: var(--ink);
+          font-size: 1.35rem;
+          font-weight: 760;
+          line-height: 1.2;
+          margin: 0;
+          letter-spacing: 0;
+        }
+        .analytics-group-heading {
+          color: var(--ink);
+          font-size: 0.98rem;
+          font-weight: 730;
+          line-height: 1.2;
+          margin: 18px 0 8px 0;
+          letter-spacing: 0;
+        }
         .analytics-card-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -791,8 +811,26 @@ def render_analytics_card_grid(cards: list[dict]) -> None:
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
+def render_dashboard_section_header(title: str) -> None:
+    st.markdown(
+        (
+            '<div class="dashboard-section-header">'
+            f'<p class="dashboard-section-header-title">{escape(title)}</p>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_analytics_group_heading(title: str) -> None:
+    st.markdown(
+        f'<p class="analytics-group-heading">{escape(title)}</p>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_period_summary_cards(period_name: str, period_values: dict) -> None:
-    st.markdown(f"#### {escape(period_name.title())}")
+    render_analytics_group_heading(period_name.title())
     sorted_values = sorted(period_values.items(), key=lambda item: item[0], reverse=True)
     cards = [
         {
@@ -2601,7 +2639,7 @@ if selected_view == "Journal":
                             st.warning("That trade was already removed.")
 
 if selected_view == "Performance":
-    st.subheader("Performance")
+    render_dashboard_section_header("Performance")
     trades = df("trades", 500).to_dict("records")
     metrics = calculate_metrics(trades)
     mcols = st.columns(5)
@@ -2631,11 +2669,11 @@ if selected_view == "Performance":
         render_period_summary_cards(name, periods[name])
 
 if selected_view == "Breakdowns":
-    st.subheader("Breakdown Analytics")
+    render_dashboard_section_header("Breakdowns")
     trades = df("trades", 500).to_dict("records")
     data = breakdowns(trades)
     for name, metrics_by_group in data.items():
-        st.markdown(f"#### {name.replace('_', ' ').title()}")
+        render_analytics_group_heading(name.replace("_", " ").title())
         table = pd.DataFrame(
             [{"group": group, **metrics} for group, metrics in metrics_by_group.items()]
         )

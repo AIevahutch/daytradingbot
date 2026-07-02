@@ -134,9 +134,20 @@ def test_performance_and_breakdowns_use_responsive_summary_cards():
             'if selected_view == "Paper":'
         )
     ]
+    period_cards_section = source[
+        source.index("def render_period_summary_cards(") : source.index(
+            "def render_breakdown_metric_cards("
+        )
+    ]
 
     assert "render_period_summary_cards(" in performance_section
     assert "render_breakdown_metric_cards(" in breakdowns_section
+    assert 'render_dashboard_section_header("Performance")' in performance_section
+    assert 'render_dashboard_section_header("Breakdowns")' in breakdowns_section
+    assert 'st.subheader("Performance")' not in performance_section
+    assert 'st.subheader("Breakdown Analytics")' not in breakdowns_section
+    assert "render_analytics_group_heading(period_name.title())" in period_cards_section
+    assert "render_analytics_group_heading(" in breakdowns_section
     assert "show_table(" not in performance_section
     assert "show_table(" not in breakdowns_section
     assert 'if "total_pl" in breakdown_table.columns:' in breakdowns_section
